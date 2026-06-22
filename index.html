@@ -3,38 +3,47 @@
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<script type="module" src="/src/theme-init.ts"></script>
 
 		<script>
 			;(function () {
 				var storageKey = "learnvault:theme"
 				var root = document.documentElement
-				var themeClassNames = {
-					light: "sds-theme-light",
-					dark: "sds-theme-dark",
-				}
 
 				var applyTheme = function (theme) {
-					var themeClass = themeClassNames[theme]
-					root.classList.remove(themeClassNames.light, themeClassNames.dark)
-					root.classList.add(themeClass)
+					root.classList.remove(
+						"sds-theme-light",
+						"sds-theme-dark",
+						"light",
+						"dark",
+					)
+					if (theme === "dark") {
+						root.classList.add("sds-theme-dark", "dark")
+					} else {
+						root.classList.add("sds-theme-light", "light")
+					}
 					root.setAttribute("data-theme", theme)
-					root.setAttribute("data-sds-theme", themeClass)
+					root.setAttribute("data-sds-theme", "sds-theme-" + theme)
 					root.style.colorScheme = theme
 				}
 
 				try {
-					var rawTheme = localStorage.getItem(storageKey)
-					var parsedTheme = rawTheme ? JSON.parse(rawTheme) : null
-					var preferredTheme =
-						parsedTheme === "light" || parsedTheme === "dark"
-							? parsedTheme
-							: window.matchMedia("(prefers-color-scheme: dark)").matches
+					var raw = localStorage.getItem(storageKey)
+					var stored = raw ? JSON.parse(raw) : null
+					// Prefer explicit user choice; fall back to OS colour-scheme preference
+					var prefersDark =
+						typeof window !== "undefined" &&
+						typeof window.matchMedia === "function" &&
+						window.matchMedia("(prefers-color-scheme: dark)").matches
+					var resolved =
+						stored === "light" || stored === "dark"
+							? stored
+							: prefersDark
 								? "dark"
 								: "light"
-
-					applyTheme(preferredTheme)
-				} catch (error) {
-					applyTheme("light")
+					applyTheme(resolved)
+				} catch (e) {
+					applyTheme("dark")
 				}
 			})()
 		</script>
@@ -82,6 +91,7 @@
 	</head>
 
 	<body>
+		<a href="#main-content" class="skip-to-content">Skip to content</a>
 		<div id="root"></div>
 		<script type="module" src="/src/main.tsx"></script>
 	</body>

@@ -3,11 +3,13 @@ import LanguageDetector from "i18next-browser-languagedetector"
 import { initReactI18next } from "react-i18next"
 
 import en from "./locales/en.json"
+import es from "./locales/es.json"
 import fr from "./locales/fr.json"
 import sw from "./locales/sw.json"
 
 const resources = {
 	en: { translation: en },
+	es: { translation: es },
 	fr: { translation: fr },
 	sw: { translation: sw },
 }
@@ -22,6 +24,9 @@ void i18n
 	// for all options read: https://www.i18next.com/overview/configuration-options
 	.init({
 		resources,
+		supportedLngs: ["en", "es", "fr", "sw"],
+		nonExplicitSupportedLngs: true,
+		load: "languageOnly",
 		fallbackLng: "en",
 		interpolation: {
 			escapeValue: false, // not needed for react as it escapes by default

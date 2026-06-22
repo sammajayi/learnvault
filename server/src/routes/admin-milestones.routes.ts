@@ -1,13 +1,20 @@
 import { Router } from "express"
 import {
+	listMilestones,
 	getPendingMilestones,
 	getMilestoneById,
 	approveMilestone,
+	batchApproveMilestones,
+	batchRejectMilestones,
 	rejectMilestone,
+	verifyMilestoneOracle,
 } from "../controllers/admin-milestones.controller"
+import { resubmitMilestoneReport } from "../controllers/milestone-resubmit.controller"
 import { submitMilestoneReport } from "../controllers/milestone-submit.controller"
 import {
 	approveMilestoneBodySchema,
+	batchApproveMilestonesBodySchema,
+	batchRejectMilestonesBodySchema,
 	legacyMilestoneSubmitBodySchema,
 	milestoneReportIdParamSchema,
 	milestoneSubmitBodySchema,
@@ -18,6 +25,8 @@ import { milestoneSubmissionLimiter } from "../middleware/rate-limit.middleware"
 import { validate } from "../middleware/validate.middleware"
 
 export const adminMilestonesRouter = Router()
+
+adminMilestonesRouter.get("/admin/milestones", requireAdmin, listMilestones)
 
 /**
  * @openapi
@@ -75,6 +84,42 @@ adminMilestonesRouter.get(
 
 /**
  * @openapi
+ * /api/admin/milestones/{id}/verify-oracle:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Run GitHub proof-of-work verification for a milestone report
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Oracle verification result
+ *       400:
+ *         $ref: '#/components/responses/BadRequestError'
+ *       401:
+ *         $ref: '#/components/responses/UnauthorizedError'
+ *       403:
+ *         $ref: '#/components/responses/ForbiddenError'
+ *       404:
+ *         $ref: '#/components/responses/NotFoundError'
+ *       502:
+ *         description: GitHub API request failed
+ */
+adminMilestonesRouter.post(
+	"/admin/milestones/:id/verify-oracle",
+	requireAdmin,
+	validate({
+		params: milestoneReportIdParamSchema,
+	}),
+	verifyMilestoneOracle,
+)
+
+/**
+ * @openapi
  * /api/admin/milestones/{id}/approve:
  *   post:
  *     tags: [Admin]
@@ -106,6 +151,15 @@ adminMilestonesRouter.post(
 		body: approveMilestoneBodySchema,
 	}),
 	approveMilestone,
+)
+
+adminMilestonesRouter.post(
+	"/admin/milestones/batch-approve",
+	requireAdmin,
+	validate({
+		body: batchApproveMilestonesBodySchema,
+	}),
+	batchApproveMilestones,
 )
 
 /**
@@ -153,6 +207,15 @@ adminMilestonesRouter.post(
 		body: rejectMilestoneBodySchema,
 	}),
 	rejectMilestone,
+)
+
+adminMilestonesRouter.post(
+	"/admin/milestones/batch-reject",
+	requireAdmin,
+	validate({
+		body: batchRejectMilestonesBodySchema,
+	}),
+	batchRejectMilestones,
 )
 
 /**
@@ -209,4 +272,42 @@ adminMilestonesRouter.post(
 		body: milestoneSubmitBodySchema,
 	}),
 	submitMilestoneReport,
+)
+
+/**
+ * @openapi
+ * /api/milestones/resubmit:
+ *   post:
+ *     tags: [Milestones]
+ *     summary: Scholar resubmits a rejected milestone report
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [id]
+ *             properties:
+ *               id:
+ *                 type: integer
+ *               evidenceGithub:
+ *                 type: string
+ *               evidenceIpfsCid:
+ *                 type: string
+ *               evidenceDescription:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Report resubmitted
+ *       400:
+ *         $ref: '#/components/responses/BadRequestError'
+ *       404:
+ *         description: Report not found
+ *       429:
+ *         description: Rate limit exceeded
+ */
+adminMilestonesRouter.post(
+	"/milestones/resubmit",
+	milestoneSubmissionLimiter,
+	resubmitMilestoneReport,
 )

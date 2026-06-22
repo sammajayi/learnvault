@@ -2,16 +2,28 @@ import React, { useEffect, useMemo, useState } from "react"
 import { Helmet } from "react-helmet"
 import { useSearchParams } from "react-router-dom"
 import CommentSection from "../components/CommentSection"
+import ConfirmDialog from "../components/ConfirmDialog"
 import Pagination from "../components/Pagination"
+import { NoProposalsEmptyState } from "../components/SkeletonLoader"
+import { EmptyState as StateEmpty } from "../components/states/emptyState"
+import { ErrorState } from "../components/states/errorState"
+import { useToast } from "../components/Toast/ToastProvider"
 import {
 	type ProposalRecord,
 	useProposal,
+	useProposalVotes,
 	useProposals,
 } from "../hooks/useProposals"
+import {
+	hasProposalDraft,
+	getDraftTimestamp,
+	clearProposalDraft,
+} from "../util/proposalDraft"
 
 type FilterType =
 	| "Voting Open"
 	| "Voting Closed"
+	| "Queued"
 	| "Passed"
 	| "Rejected"
 	| "All"
@@ -25,20 +37,25 @@ const shortenAddress = (address: string) => {
 	return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
-const formatCountdown = (deadline: string | null, now: number) => {
+const formatCountdown = (
+	deadline: string | null,
+	now: number,
+	{ queued = false }: { queued?: boolean } = {},
+) => {
 	if (!deadline) return "No deadline set"
 
 	const diff = new Date(deadline).getTime() - now
-	if (diff <= 0) return "Voting closed"
+	if (diff <= 0) return queued ? "Ready for execution" : "Voting closed"
 
 	const minutes = Math.floor(diff / (1000 * 60))
 	const days = Math.floor(minutes / (60 * 24))
 	const hours = Math.floor((minutes % (60 * 24)) / 60)
 	const mins = minutes % 60
 
-	if (days > 0) return `${days}d ${hours}h remaining`
-	if (hours > 0) return `${hours}h ${mins}m remaining`
-	return `${Math.max(mins, 1)}m remaining`
+	const prefix = queued ? "Execution in " : ""
+	if (days > 0) return `${prefix}${days}d ${hours}h remaining`
+	if (hours > 0) return `${prefix}${hours}h ${mins}m remaining`
+	return `${prefix}${Math.max(mins, 1)}m remaining`
 }
 
 const formatTokenAmount = (value: bigint) => value.toString()
@@ -46,6 +63,7 @@ const formatTokenAmount = (value: bigint) => value.toString()
 const getFilterValue = (proposal: ProposalRecord): FilterType => {
 	if (proposal.displayStatus === "Voting Open") return "Voting Open"
 	if (proposal.displayStatus === "Voting Closed") return "Voting Closed"
+	if (proposal.displayStatus === "Queued") return "Queued"
 	if (proposal.displayStatus === "Passed") return "Passed"
 	return "Rejected"
 }
@@ -53,6 +71,7 @@ const getFilterValue = (proposal: ProposalRecord): FilterType => {
 const DaoProposals: React.FC = () => {
 	const [searchParams, setSearchParams] = useSearchParams()
 	const [filter, setFilter] = useState<FilterType>("Voting Open")
+	const [showLiveVotes, setShowLiveVotes] = useState(false)
 	const [now, setNow] = useState(() => Date.now())
 	const {
 		proposals,
@@ -61,7 +80,58 @@ const DaoProposals: React.FC = () => {
 		isVoting,
 		walletAddress,
 		isLoading,
+		error,
+		refetch,
+		cancelProposal,
+		isCancelling,
 	} = useProposals()
+	const { showSuccess } = useToast()
+
+	const [hasDraft, setHasDraft] = useState(false)
+	const [draftTimestamp, setDraftTimestamp] = useState<number | null>(null)
+
+	useEffect(() => {
+		const existingDraft = hasProposalDraft()
+		setHasDraft(existingDraft)
+		if (existingDraft) {
+			setDraftTimestamp(getDraftTimestamp())
+		}
+	}, [])
+
+	const [showDeleteDraftConfirm, setShowDeleteDraftConfirm] = useState(false)
+
+	const handleDeleteDraft = () => {
+		clearProposalDraft()
+		setHasDraft(false)
+		setDraftTimestamp(null)
+		setShowDeleteDraftConfirm(false)
+		showSuccess("Draft deleted")
+	}
+
+	const formatDraftTime = (timestamp: number | null): string => {
+		if (!timestamp) return ""
+		const date = new Date(timestamp)
+		const now = new Date()
+		const diffMs = now.getTime() - date.getTime()
+		const diffMins = Math.floor(diffMs / 60000)
+
+		if (diffMins < 1) return "just now"
+		if (diffMins < 60) return `${diffMins}m ago`
+		if (diffMins < 1440) return `${Math.floor(diffMins / 60)}h ago`
+		return date.toLocaleDateString()
+	}
+
+	const [showCancelConfirm, setShowCancelConfirm] = useState(false)
+
+	const handleCancelProposal = async () => {
+		if (!selectedProposal) return
+		try {
+			await cancelProposal(selectedProposal.id)
+			setShowCancelConfirm(false)
+		} catch (err) {
+			console.error("Cancel proposal failed", err)
+		}
+	}
 
 	const proposalParam = searchParams.get("proposal")
 	const pageParam = searchParams.get("page")
@@ -98,6 +168,10 @@ const DaoProposals: React.FC = () => {
 	const selectedProposalId =
 		selectedFromList?.id ?? fallbackSelected?.id ?? null
 	const selectedProposalQuery = useProposal(selectedProposalId)
+	const showVotesSection = Boolean(
+		selectedProposal && (!selectedProposal.isVotingOpen || showLiveVotes),
+	)
+	const votesQuery = useProposalVotes(selectedProposalId, showVotesSection)
 	const selectedProposal =
 		selectedProposalQuery.data ?? selectedFromList ?? fallbackSelected ?? null
 
@@ -203,34 +277,87 @@ const DaoProposals: React.FC = () => {
 
 	if (isLoading) {
 		return (
-			<div className="p-12 max-w-5xl mx-auto text-center h-[60vh] flex flex-col items-center justify-center">
+			<div className="p-6 md:p-12 max-w-5xl mx-auto text-center h-[60vh] flex flex-col items-center justify-center">
 				<div className="w-12 h-12 border-4 border-brand-cyan/20 border-t-brand-cyan rounded-full animate-spin mb-4" />
 				<p className="text-white/60 font-medium">Loading proposals...</p>
 			</div>
 		)
 	}
 
+	if (error) {
+		return (
+			<div className="p-6 md:p-12 max-w-5xl mx-auto text-white animate-in fade-in slide-in-from-bottom-8 duration-1000">
+				<ErrorState
+					message={(error as Error).message || String(error)}
+					onRetry={() => void refetch()}
+				/>
+			</div>
+		)
+	}
+
+	if (proposals.length === 0) {
+		return (
+			<div className="p-6 md:p-12 max-w-5xl mx-auto text-white animate-in fade-in slide-in-from-bottom-8 duration-1000">
+				<NoProposalsEmptyState />
+			</div>
+		)
+	}
+
 	return (
-		<div className="p-12 max-w-5xl mx-auto text-white animate-in fade-in slide-in-from-bottom-8 duration-1000">
+		<div className="p-6 md:p-12 max-w-5xl mx-auto text-white animate-in fade-in slide-in-from-bottom-8 duration-1000">
 			<Helmet>
 				<title>{title}</title>
 			</Helmet>
 
-			<header className="mb-16 text-center">
-				<h1 className="text-6xl font-black mb-4 tracking-tighter text-gradient">
+			<header className="mb-10 sm:mb-16 text-center">
+				<h1 className="text-4xl sm:text-5xl md:text-6xl font-black mb-3 sm:mb-4 tracking-tighter text-gradient">
 					DAO Proposals
 				</h1>
-				<p className="text-white/70 text-lg font-medium max-w-2xl mx-auto">
+				<p className="text-white/70 text-sm sm:text-base md:text-lg font-medium max-w-2xl mx-auto px-2">
 					Review live governance proposals, track vote totals, and follow the
 					discussion in real time.
 				</p>
 			</header>
+
+			{hasDraft && (
+				<div className="mb-12 glass-card p-6 rounded-[2rem] border border-brand-amber/30 bg-brand-amber/5 animate-in fade-in slide-in-from-top-4 duration-700 flex flex-col md:flex-row items-center justify-between gap-4">
+					<div className="flex items-center gap-4">
+						<div className="w-12 h-12 rounded-2xl bg-brand-amber/20 flex items-center justify-center text-2xl">
+							📝
+						</div>
+						<div>
+							<h3 className="font-black text-lg text-brand-amber">
+								Unfinished Proposal Draft
+							</h3>
+							<p className="text-white/50 text-sm">
+								You have a draft saved {formatDraftTime(draftTimestamp)}.
+							</p>
+						</div>
+					</div>
+					<div className="flex items-center gap-3">
+						<button
+							type="button"
+							onClick={() => setShowDeleteDraftConfirm(true)}
+							className="px-6 py-2 text-xs font-black uppercase tracking-widest text-white/40 hover:text-red-400 transition-colors"
+						>
+							Discard
+						</button>
+						<a
+							href="/dao/propose"
+							className="px-8 py-2.5 bg-brand-amber/20 border border-brand-amber/40 text-brand-amber text-xs font-black uppercase tracking-widest rounded-full hover:bg-brand-amber/30 transition-all"
+						>
+							Continue Editing
+						</a>
+					</div>
+				</div>
+			)}
 
 			<div className="flex flex-wrap gap-3 mb-8 justify-center">
 				{(
 					[
 						"Voting Open",
 						"Voting Closed",
+						"Queued",
 						"Passed",
 						"Rejected",
 						"All",
@@ -252,53 +379,73 @@ const DaoProposals: React.FC = () => {
 			</div>
 
 			{selectedProposal && (
-				<section className="glass-card p-10 rounded-[2.5rem] border border-white/5 mb-10">
-					<div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between mb-8">
-						<div>
+				<section className="glass-card p-5 sm:p-8 lg:p-10 rounded-[2rem] lg:rounded-[2.5rem] border border-white/5 mb-10">
+					<div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between mb-6 sm:mb-8">
+						<div className="min-w-0">
 							<h2
-								className="text-4xl font-black tracking-tight mb-3"
+								className="text-2xl sm:text-3xl lg:text-4xl font-black tracking-tight mb-3 break-words"
 								data-testid="proposal-detail-title"
 							>
 								{selectedProposal.title}
 							</h2>
-							<div className="flex flex-wrap items-center gap-3 text-xs font-black uppercase tracking-widest">
+							<div className="flex flex-wrap items-center gap-2 sm:gap-3 text-[10px] sm:text-xs font-black uppercase tracking-widest">
 								<span className="text-brand-cyan">
 									Applicant {shortenAddress(selectedProposal.authorAddress)}
 								</span>
-								<span className="w-1.5 h-1.5 bg-white/20 rounded-full" />
+								<span className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-white/20 rounded-full" />
 								<span className="text-white/70">ID #{selectedProposal.id}</span>
-								<span className="w-1.5 h-1.5 bg-white/20 rounded-full" />
+								<span className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-white/20 rounded-full" />
 								<span className="text-white/50">
-									{formatCountdown(selectedProposal.deadline, now)}
+									{formatCountdown(
+										selectedProposal.executionReadyAt ??
+											selectedProposal.deadline,
+										now,
+										{ queued: selectedProposal.status === "queued" },
+									)}
 								</span>
 							</div>
 						</div>
-						<div className="px-5 py-2 bg-brand-cyan/10 border border-brand-cyan/30 rounded-full text-brand-cyan text-xs font-black uppercase">
-							{selectedProposal.displayStatus}
+						<div className="flex flex-row lg:flex-col items-center lg:items-end gap-3 self-start">
+							<div className="px-4 sm:px-5 py-2 bg-brand-cyan/10 border border-brand-cyan/30 rounded-full text-brand-cyan text-[10px] sm:text-xs font-black uppercase whitespace-nowrap">
+								{selectedProposal.displayStatus}
+							</div>
+							{selectedProposal.authorAddress === walletAddress &&
+								selectedProposal.displayStatus === "Voting Open" && (
+									<button
+										type="button"
+										onClick={() => setShowCancelConfirm(true)}
+										disabled={isCancelling}
+										className="text-[10px] font-black uppercase text-red-400/70 hover:text-red-400 transition-colors"
+									>
+										{isCancelling ? "Cancelling..." : "Cancel Proposal"}
+									</button>
+								)}
 						</div>
 					</div>
 
-					<div className="grid gap-8 md:grid-cols-2">
+					<div className="grid gap-6 sm:gap-8 md:grid-cols-2">
 						<div>
-							<h3 className="text-xl font-black mb-3">Description</h3>
-							<p className="text-white/70 leading-relaxed whitespace-pre-wrap mb-8">
+							<h3 className="text-lg sm:text-xl font-black mb-3">
+								Description
+							</h3>
+							<p className="text-white/70 text-sm sm:text-base leading-relaxed whitespace-pre-wrap mb-6 sm:mb-8 break-words">
 								{selectedProposal.description}
 							</p>
 
 							<div className="grid gap-4 sm:grid-cols-2">
-								<div className="rounded-[1.75rem] border border-white/5 bg-white/5 p-6">
+								<div className="rounded-[1.75rem] border border-white/5 bg-white/5 p-4 sm:p-6">
 									<p className="text-[10px] text-white/70 uppercase font-black tracking-widest mb-2">
 										My Voting Power
 									</p>
-									<h3 className="text-2xl font-black">
+									<h3 className="text-xl sm:text-2xl font-black break-all">
 										{formatTokenAmount(votingPower)} GOV
 									</h3>
 								</div>
-								<div className="rounded-[1.75rem] border border-white/5 bg-white/5 p-6">
+								<div className="rounded-[1.75rem] border border-white/5 bg-white/5 p-4 sm:p-6">
 									<p className="text-[10px] text-white/70 uppercase font-black tracking-widest mb-2">
 										Requested Amount
 									</p>
-									<h3 className="text-2xl font-black">
+									<h3 className="text-xl sm:text-2xl font-black">
 										{selectedProposal.amount.toLocaleString()} USDC
 									</h3>
 								</div>
@@ -306,7 +453,9 @@ const DaoProposals: React.FC = () => {
 						</div>
 
 						<div>
-							<h3 className="text-xl font-black mb-4">Voting Stats</h3>
+							<h3 className="text-lg sm:text-xl font-black mb-4">
+								Voting Stats
+							</h3>
 							<div className="mb-6">
 								<div className="flex justify-between text-xs font-black uppercase tracking-widest mb-2">
 									<span>Yes {yesPercent}%</span>
@@ -324,7 +473,7 @@ const DaoProposals: React.FC = () => {
 								</div>
 							</div>
 
-							<div className="space-y-3 mb-8 text-sm text-white/60">
+							<div className="space-y-3 mb-8 text-xs sm:text-sm text-white/60">
 								<p>
 									<span data-testid="vote-yes-count">
 										Yes votes: {formatTokenAmount(selectedProposal.votesFor)}{" "}
@@ -340,7 +489,94 @@ const DaoProposals: React.FC = () => {
 								<p>
 									Total voting power cast: {formatTokenAmount(totalVotes)} GOV
 								</p>
-								<p>{formatCountdown(selectedProposal.deadline, now)}</p>
+								<p>
+									{formatCountdown(
+										selectedProposal.executionReadyAt ??
+											selectedProposal.deadline,
+										now,
+										{ queued: selectedProposal.status === "queued" },
+									)}
+								</p>
+							</div>
+							<div className="mb-8 rounded-2xl border border-white/10 bg-white/5 p-3 sm:p-4">
+								<div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
+									<h4 className="text-xs sm:text-sm font-black uppercase tracking-widest text-white/70">
+										Vote transparency
+									</h4>
+									{selectedProposal?.isVotingOpen && (
+										<label className="text-xs text-white/60 flex items-center gap-2 cursor-pointer min-h-[44px]">
+											<input
+												type="checkbox"
+												checked={showLiveVotes}
+												onChange={(e) => setShowLiveVotes(e.target.checked)}
+												className="w-4 h-4"
+											/>
+											Show before close
+										</label>
+									)}
+								</div>
+								{showVotesSection ? (
+									<>
+										<div className="flex items-center gap-3 sm:gap-4 mb-4 flex-wrap">
+											<div
+												className="w-16 h-16 sm:w-20 sm:h-20 rounded-full border border-white/10 shrink-0"
+												style={{
+													background: `conic-gradient(#00d4ff 0 ${yesPercent}%, #a855f7 ${yesPercent}% 100%)`,
+												}}
+												aria-label="Vote breakdown pie chart"
+												title={`For ${yesPercent}%, Against ${noPercent}%`}
+											/>
+											<div className="text-[11px] sm:text-xs text-white/60 space-y-1">
+												<p>For: {yesPercent}%</p>
+												<p>Against: {noPercent}%</p>
+											</div>
+										</div>
+										{votesQuery.data?.unavailable ? (
+											<p className="text-xs text-white/40">
+												Voter list endpoint is not available yet.
+											</p>
+										) : (
+											<ul className="space-y-2 max-h-56 overflow-auto pr-1">
+												{(votesQuery.data?.votes ?? []).map((vote, idx) => (
+													<li
+														key={`${vote.voterAddress}-${idx}`}
+														className="flex items-center justify-between rounded-lg border border-white/10 px-3 py-2 text-[11px] sm:text-xs"
+													>
+														<span
+															title={vote.voterAddress}
+															className="font-mono text-white/70 truncate max-w-[80px] sm:max-w-none"
+														>
+															{vote.voterAddress.slice(0, 6)}...
+															{vote.voterAddress.slice(-4)}
+														</span>
+														<span
+															className={
+																vote.support
+																	? "text-brand-cyan"
+																	: "text-brand-purple"
+															}
+														>
+															{vote.support ? "For" : "Against"}
+														</span>
+														<span className="text-white/60">
+															{vote.weight.toString()}
+														</span>
+													</li>
+												))}
+												{(votesQuery.data?.votes?.length ?? 0) === 0 && (
+													<li className="text-xs text-white/40">
+														No vote records available.
+													</li>
+												)}
+											</ul>
+										)}
+									</>
+								) : (
+									<p className="text-xs text-white/40">
+										Voter list is shown after voting closes, or enable the
+										opt-in toggle.
+									</p>
+								)}
 							</div>
 
 							{userHasVoted ? (
@@ -348,7 +584,7 @@ const DaoProposals: React.FC = () => {
 									You voted {voteChoice ? "Yes" : "No"}
 								</div>
 							) : (
-								<div className="flex gap-3">
+								<div className="flex flex-col sm:flex-row gap-3">
 									<button
 										type="button"
 										data-testid="vote-yes"
@@ -359,7 +595,7 @@ const DaoProposals: React.FC = () => {
 											})
 										}
 										disabled={voteDisabled || isVoting}
-										className="px-8 py-3 bg-brand-cyan/10 border border-brand-cyan/30 text-brand-cyan font-black uppercase tracking-widest rounded-full hover:bg-brand-cyan/20 disabled:opacity-30 transition-all"
+										className="w-full sm:w-auto min-h-[52px] px-8 py-3 bg-brand-cyan/10 border border-brand-cyan/30 text-brand-cyan font-black uppercase tracking-widest rounded-full hover:bg-brand-cyan/20 disabled:opacity-30 transition-all"
 									>
 										{isVoting ? "Voting..." : "Vote Yes"}
 									</button>
@@ -373,7 +609,7 @@ const DaoProposals: React.FC = () => {
 											})
 										}
 										disabled={voteDisabled || isVoting}
-										className="px-8 py-3 bg-brand-purple/10 border border-brand-purple/30 text-brand-purple font-black uppercase tracking-widest rounded-full hover:bg-brand-purple/20 disabled:opacity-30 transition-all"
+										className="w-full sm:w-auto min-h-[52px] px-8 py-3 bg-brand-purple/10 border border-brand-purple/30 text-brand-purple font-black uppercase tracking-widest rounded-full hover:bg-brand-purple/20 disabled:opacity-30 transition-all"
 									>
 										{isVoting ? "Voting..." : "Vote No"}
 									</button>
@@ -395,22 +631,22 @@ const DaoProposals: React.FC = () => {
 				</section>
 			)}
 
-			<div className="grid gap-6">
+			<div className="grid gap-4 sm:gap-6">
 				{currentProposals.map((proposal) => (
 					<button
 						key={proposal.id}
 						type="button"
 						onClick={() => handleSelectProposal(proposal.id)}
-						className={`glass-card p-8 rounded-[2.5rem] border text-left transition-all ${
+						className={`glass-card p-5 sm:p-8 rounded-[1.5rem] sm:rounded-[2.5rem] border text-left transition-all ${
 							selectedProposal?.id === proposal.id
 								? "border-brand-cyan/40"
 								: "border-white/5 hover:border-brand-cyan/20"
 						}`}
 					>
-						<div className="flex justify-between items-start gap-4 mb-4">
-							<div>
+						<div className="flex justify-between items-start gap-3 sm:gap-4 mb-3 sm:mb-4">
+							<div className="min-w-0">
 								<h2
-									className="text-2xl font-black mb-1"
+									className="text-lg sm:text-2xl font-black mb-1 break-words"
 									data-testid="proposal-title"
 								>
 									{proposal.title}
@@ -419,18 +655,26 @@ const DaoProposals: React.FC = () => {
 									Applicant {shortenAddress(proposal.authorAddress)}
 								</p>
 							</div>
-							<span className="px-3 py-1 bg-white/5 text-[10px] uppercase font-black rounded-full border border-white/10">
+							<span className="px-2 sm:px-3 py-1 bg-white/5 text-[10px] uppercase font-black rounded-full border border-white/10 whitespace-nowrap shrink-0">
 								{proposal.displayStatus}
 							</span>
 						</div>
-						<p className="text-sm text-white/60 mb-5 line-clamp-2">
+						<p className="text-xs sm:text-sm text-white/60 mb-4 sm:mb-5 line-clamp-2">
 							{proposal.description}
 						</p>
-						<div className="flex flex-wrap items-center gap-6 text-[10px] font-black uppercase tracking-widest text-white/40">
+						<div className="flex flex-wrap items-center gap-3 sm:gap-6 text-[10px] font-black uppercase tracking-widest text-white/40">
 							<span>Yes: {formatTokenAmount(proposal.votesFor)}</span>
 							<span>No: {formatTokenAmount(proposal.votesAgainst)}</span>
-							<span>{formatCountdown(proposal.deadline, now)}</span>
-							<span className="ml-auto text-brand-cyan">View details</span>
+							<span>
+								{formatCountdown(
+									proposal.executionReadyAt ?? proposal.deadline,
+									now,
+									{ queued: proposal.status === "queued" },
+								)}
+							</span>
+							<span className="sm:ml-auto text-brand-cyan text-[10px]">
+								View details
+							</span>
 						</div>
 					</button>
 				))}
@@ -438,8 +682,20 @@ const DaoProposals: React.FC = () => {
 
 			{filteredProposals.length === 0 && (
 				<div className="py-20 text-center opacity-50">
-					<p>No proposals found for this filter.</p>
+					<StateEmpty
+						icon="📑"
+						title="No proposals found"
+						description="Try a different filter or view all proposals."
+						ctaLabel="Show all proposals"
+						onCtaClick={() => handleFilterChange("All")}
+					/>
 				</div>
+			)}
+
+			{filteredProposals.length > 0 && (
+				<p className="text-center text-xs text-white/40 font-black uppercase tracking-widest mt-8 mb-2">
+					Page {safePage} of {totalPages}
+				</p>
 			)}
 
 			<Pagination

@@ -7,7 +7,9 @@ on:
     paths:
       - "src/**"
       - "package.json"
+      - "package-lock.json"
       - "vite.config.ts"
+      - "vitest.config.ts"
       - "tsconfig*.json"
       - "eslint.config.js"
 
@@ -23,10 +25,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --legacy-peer-deps --force
+
+      - name: i18n key parity check
+        run: npm run i18n-check
 
       - name: Type check
         run: npm run typecheck
@@ -34,16 +38,8 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Test
-        run: npm run test:frontend
+      - name: Test with coverage
+        run: npm run test:coverage
 
       - name: Build
         run: npm run build
-
-      - name: Upload build artifact
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist
-          path: dist
-          if-no-files-found: error

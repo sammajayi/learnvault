@@ -1,14 +1,16 @@
 extern crate std;
 
 use soroban_sdk::{
-    Address, Env, IntoVal, String, Val, Vec, contract, contractimpl, contracttype, symbol_short, vec,
+    Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec, contract, contractimpl, contracttype,
+    symbol_short,
     testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
 };
 
 use crate::{
-    CourseConfig, CourseMilestone, CourseMilestoneClient, DataKey, Error, MilestoneCompleted,
-    MilestoneStatus,
+    ApprovalResult, CourseCompleted, CourseConfig, CourseMilestone, CourseMilestoneClient,
+    DataKey, Error, MilestoneCompleted, MilestoneStatus, VerifyBatchEntry,
 };
+use crate::errors::{MAX_COURSE_ID_LEN, MAX_MILESTONE_COUNT};
 
 #[contracttype]
 enum MockTokenDataKey {
@@ -78,7 +80,14 @@ fn setup() -> (
     );
     client.initialize(&admin, &learn_token_id);
 
-    (env, contract_id, admin, learn_token_id, client, token_client)
+    (
+        env,
+        contract_id,
+        admin,
+        learn_token_id,
+        client,
+        token_client,
+    )
 }
 
 fn add_course(
@@ -130,10 +139,19 @@ fn submit_milestone(
         learner,
         contract_id,
         "submit_milestone",
-        (learner.clone(), course_id.clone(), milestone_id, evidence_uri.clone()),
+        (
+            learner.clone(),
+            course_id.clone(),
+            milestone_id,
+            evidence_uri.clone(),
+        ),
     );
     client.submit_milestone(learner, course_id, &milestone_id, evidence_uri);
 }
+
+// =======================
+// ✅ ENROLL TESTS
+// =======================
 
 #[test]
 fn add_course_and_get_course_work() {
@@ -246,16 +264,99 @@ fn verify_milestone_mints_lrn_and_marks_completion() {
         &admin,
         &contract_id,
         "verify_milestone",
-        (admin.clone(), learner.clone(), course_id.clone(), 1_u32, 125_i128),
+        (
+            admin.clone(),
+            learner.clone(),
+            course_id.clone(),
+            1_u32,
+            125_i128,
+        ),
     );
     client.verify_milestone(&admin, &learner, &course_id, &1, &125);
 
     assert_eq!(
-        client.get_milestone_status(&learner, &course_id, &1),
+        client.get_milestone_state(&learner, &course_id, &1),
         MilestoneStatus::Approved
     );
     assert!(client.is_completed(&learner, &course_id, &1));
     assert_eq!(token_client.balance(&learner), 125);
+}
+
+#[test]
+fn verify_milestone_emits_course_completed_event_on_final_milestone() {
+    let (env, contract_id, admin, _token_id, client, _token_client) = setup();
+    let learner = Address::generate(&env);
+    let course_id = sid(&env, "rust-101");
+    let evidence_1 = sid(&env, "ipfs://proof-1");
+    let evidence_2 = sid(&env, "ipfs://proof-2");
+
+    add_course(&env, &contract_id, &admin, &client, &course_id, 2);
+    enroll(&env, &contract_id, &learner, &client, &course_id);
+
+    submit_milestone(
+        &env,
+        &contract_id,
+        &learner,
+        &client,
+        &course_id,
+        1,
+        &evidence_1,
+    );
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "verify_milestone",
+        (
+            admin.clone(),
+            learner.clone(),
+            course_id.clone(),
+            1_u32,
+            10_i128,
+        ),
+    );
+    client.verify_milestone(&admin, &learner, &course_id, &1, &10);
+
+    submit_milestone(
+        &env,
+        &contract_id,
+        &learner,
+        &client,
+        &course_id,
+        2,
+        &evidence_2,
+    );
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "verify_milestone",
+        (
+            admin.clone(),
+            learner.clone(),
+            course_id.clone(),
+            2_u32,
+            20_i128,
+        ),
+    );
+    client.verify_milestone(&admin, &learner, &course_id, &2, &20);
+
+    let events = env.events().all();
+    let completion_events = events
+        .iter()
+        .filter(|(_, topics, data)| {
+            topics.contains(&Symbol::new(&env, "course_done").into_val(&env)) && {
+                let payload: CourseCompleted = data.clone().into_val(&env);
+                payload
+                    == CourseCompleted {
+                        learner: learner.clone(),
+                        course_id: course_id.clone(),
+                    }
+            }
+        })
+        .count();
+
+    assert_eq!(completion_events, 1);
 }
 
 #[test]
@@ -283,7 +384,13 @@ fn verify_milestone_fails_for_non_admin() {
         &attacker,
         &contract_id,
         "verify_milestone",
-        (attacker.clone(), learner.clone(), course_id.clone(), 1_u32, 125_i128),
+        (
+            attacker.clone(),
+            learner.clone(),
+            course_id.clone(),
+            1_u32,
+            125_i128,
+        ),
     );
     let result = client.try_verify_milestone(&attacker, &learner, &course_id, &1, &125);
 
@@ -324,10 +431,61 @@ fn reject_milestone_marks_rejected_and_clears_submission() {
     client.reject_milestone(&admin, &learner, &course_id, &1);
 
     assert_eq!(
-        client.get_milestone_status(&learner, &course_id, &1),
+        client.get_milestone_state(&learner, &course_id, &1),
         MilestoneStatus::Rejected
     );
-    assert!(client.get_milestone_submission(&learner, &course_id, &1).is_none());
+    assert!(
+        client
+            .get_milestone_submission(&learner, &course_id, &1)
+            .is_none()
+    );
+}
+
+#[test]
+fn rejected_milestone_can_be_resubmitted() {
+    let (env, contract_id, admin, _token_id, client, _token_client) = setup();
+    let learner = Address::generate(&env);
+    let course_id = sid(&env, "rust-101");
+    let first_evidence_uri = sid(&env, "ipfs://proof-1");
+    let second_evidence_uri = sid(&env, "ipfs://proof-2");
+
+    add_course(&env, &contract_id, &admin, &client, &course_id, 3);
+    enroll(&env, &contract_id, &learner, &client, &course_id);
+    submit_milestone(
+        &env,
+        &contract_id,
+        &learner,
+        &client,
+        &course_id,
+        1,
+        &first_evidence_uri,
+    );
+
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "reject_milestone",
+        (admin.clone(), learner.clone(), course_id.clone(), 1_u32),
+    );
+    client.reject_milestone(&admin, &learner, &course_id, &1);
+
+    submit_milestone(
+        &env,
+        &contract_id,
+        &learner,
+        &client,
+        &course_id,
+        1,
+        &second_evidence_uri,
+    );
+
+    assert_eq!(client.get_milestone_state(&learner, &course_id, &1), MilestoneStatus::Pending);
+
+    let submission = client
+        .get_milestone_submission(&learner, &course_id, &1)
+        .expect("submission should exist after resubmission");
+    assert_eq!(submission.evidence_uri, second_evidence_uri);
 }
 
 #[test]
@@ -385,22 +543,21 @@ fn complete_milestone_marks_completion_and_emits_reward_event() {
 
     let events = env.events().all();
     let found = events.iter().any(|(_, topics, data)| {
-        topics.contains(&symbol_short!("ms_done").into_val(&env))
-            && {
-                let d: MilestoneCompleted = data.clone().into_val(&env);
-                d == MilestoneCompleted {
-                    learner: learner.clone(),
-                    course_id: course_id.clone(),
-                    milestone_id: 2,
-                    lrn_reward: 75,
-                }
+        topics.contains(&symbol_short!("ms_done").into_val(&env)) && {
+            let d: MilestoneCompleted = data.clone().into_val(&env);
+            d == MilestoneCompleted {
+                learner: learner.clone(),
+                course_id: course_id.clone(),
+                milestone_id: 2,
+                lrn_reward: 75,
             }
+        }
     });
     assert!(found, "completion event with reward was not emitted");
 
     assert!(client.is_completed(&learner, &course_id, &2));
     assert_eq!(
-        client.get_milestone_status(&learner, &course_id, &2),
+        client.get_milestone_state(&learner, &course_id, &2),
         MilestoneStatus::Approved
     );
 }
@@ -486,3 +643,356 @@ fn complete_milestone_fails_without_admin_auth() {
 
     assert!(result.is_err());
 }
+
+// ── batch_verify_milestones ──────────────────────────────────────────────────
+
+#[allow(dead_code)]
+fn verify_milestone_helper(
+    env: &Env,
+    contract_id: &Address,
+    admin: &Address,
+    client: &CourseMilestoneClient<'static>,
+    learner: &Address,
+    course_id: &String,
+    milestone_id: u32,
+    tokens: i128,
+) {
+    authorize(
+        env,
+        admin,
+        contract_id,
+        "verify_milestone",
+        (
+            admin.clone(),
+            learner.clone(),
+            course_id.clone(),
+            milestone_id,
+            tokens,
+        ),
+    );
+    client.verify_milestone(admin, learner, course_id, &milestone_id, &tokens);
+}
+
+#[test]
+fn batch_verify_milestones_happy_path() {
+    let (env, contract_id, admin, _token_id, client, token_client) = setup();
+    let learner1 = Address::generate(&env);
+    let learner2 = Address::generate(&env);
+    let course_id = sid(&env, "batch-course");
+
+    add_course(&env, &contract_id, &admin, &client, &course_id, 3);
+    enroll(&env, &contract_id, &learner1, &client, &course_id);
+    enroll(&env, &contract_id, &learner2, &client, &course_id);
+
+    let uri = sid(&env, "ipfs://evidence");
+    submit_milestone(&env, &contract_id, &learner1, &client, &course_id, 1, &uri);
+    submit_milestone(&env, &contract_id, &learner2, &client, &course_id, 1, &uri);
+
+    let submissions = soroban_sdk::vec![
+        &env,
+        VerifyBatchEntry {
+            learner: learner1.clone(),
+            course_id: course_id.clone(),
+            milestone_id: 1,
+            lrn_reward: 100,
+        },
+        VerifyBatchEntry {
+            learner: learner2.clone(),
+            course_id: course_id.clone(),
+            milestone_id: 1,
+            lrn_reward: 200,
+        },
+    ];
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "batch_verify_milestones",
+        (admin.clone(), submissions.clone()),
+    );
+    client.batch_verify_milestones(&admin, &submissions);
+
+    assert_eq!(
+        client.get_milestone_state(&learner1, &course_id, &1),
+        MilestoneStatus::Approved,
+    );
+    assert_eq!(
+        client.get_milestone_state(&learner2, &course_id, &1),
+        MilestoneStatus::Approved,
+    );
+    assert_eq!(token_client.balance(&learner1), 100);
+    assert_eq!(token_client.balance(&learner2), 200);
+}
+
+#[test]
+fn batch_verify_milestones_reverts_on_invalid_entry() {
+    let (env, contract_id, admin, _token_id, client, token_client) = setup();
+    let learner1 = Address::generate(&env);
+    let not_enrolled = Address::generate(&env);
+    let course_id = sid(&env, "batch-course");
+
+    add_course(&env, &contract_id, &admin, &client, &course_id, 3);
+    enroll(&env, &contract_id, &learner1, &client, &course_id);
+
+    let uri = sid(&env, "ipfs://evidence");
+    submit_milestone(&env, &contract_id, &learner1, &client, &course_id, 1, &uri);
+
+    // Second entry: not_enrolled learner has no enrollment → should cause revert
+    let submissions = soroban_sdk::vec![
+        &env,
+        VerifyBatchEntry {
+            learner: learner1.clone(),
+            course_id: course_id.clone(),
+            milestone_id: 1,
+            lrn_reward: 100,
+        },
+        VerifyBatchEntry {
+            learner: not_enrolled.clone(),
+            course_id: course_id.clone(),
+            milestone_id: 1,
+            lrn_reward: 100,
+        },
+    ];
+
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "batch_verify_milestones",
+        (admin.clone(), submissions.clone()),
+    );
+    let result = client.try_batch_verify_milestones(&admin, &submissions);
+    assert_eq!(
+        result.err(),
+        Some(Ok(soroban_sdk::Error::from_contract_error(
+            Error::NotEnrolled as u32
+        )))
+    );
+
+    // Because the batch reverted, learner1 should NOT be marked approved
+    assert_eq!(
+        client.get_milestone_state(&learner1, &course_id, &1),
+        MilestoneStatus::Pending,
+    );
+    // And no tokens were minted
+    assert_eq!(token_client.balance(&learner1), 0);
+}
+
+// =======================
+// ✅ UPGRADE TESTS
+// =======================
+
+#[test]
+fn upgrade_requires_admin_auth() {
+    let (env, contract_id, _admin, _token_id, client, _token_client) = setup();
+    let attacker = Address::generate(&env);
+    let wasm_hash: BytesN<32> = crate::upgrade::testutils::upload_upgrade_target(&env);
+
+    authorize(
+        &env,
+        &attacker,
+        &contract_id,
+        "upgrade",
+        (wasm_hash.clone(),),
+    );
+    let result = client.try_upgrade(&wasm_hash);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn state_persists_after_upgrade() {
+    let (env, contract_id, admin, _token_id, client, _token_client) = setup();
+    let learner = Address::generate(&env);
+    let course_id = sid(&env, "soroban-101");
+
+    add_course(&env, &contract_id, &admin, &client, &course_id, 3);
+    enroll(&env, &contract_id, &learner, &client, &course_id);
+
+    let wasm_hash = crate::upgrade::testutils::upload_upgrade_target(&env);
+    authorize(&env, &admin, &contract_id, "upgrade", (wasm_hash.clone(),));
+    client.upgrade(&wasm_hash);
+
+    let stored_course = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<_, CourseConfig>(&DataKey::Course(course_id.clone()))
+    });
+    let enrolled = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Enrollment(learner.clone(), course_id.clone()))
+            .unwrap_or(false)
+    });
+    let stored_hash = env.as_contract(&contract_id, || crate::upgrade::current_hash(&env));
+
+    assert_eq!(
+        stored_course,
+        Some(CourseConfig {
+            milestone_count: 3,
+            active: true,
+        })
+    );
+    assert!(enrolled);
+    assert_eq!(stored_hash, wasm_hash);
+}
+
+fn register_course(
+    env: &Env,
+    contract_id: &Address,
+    admin: &Address,
+    client: &CourseMilestoneClient<'static>,
+    course_id: &String,
+    milestone_count: u32,
+) {
+    authorize(
+        env,
+        admin,
+        contract_id,
+        "register_course",
+        (admin.clone(), course_id.clone(), milestone_count),
+    );
+    client.register_course(admin, course_id, &milestone_count);
+}
+
+#[test]
+fn register_course_rejects_empty_course_id() {
+    let (env, contract_id, admin, _, client, _) = setup();
+    let course_id = sid(&env, "");
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "register_course",
+        (admin.clone(), course_id.clone(), 3_u32),
+    );
+
+    let result = client.try_register_course(&admin, &course_id, &3);
+    assert_eq!(
+        result.err(),
+        Some(Ok(soroban_sdk::Error::from_contract_error(
+            Error::InvalidCourseId as u32
+        )))
+    );
+}
+
+#[test]
+fn register_course_rejects_course_id_over_max_length() {
+    let (env, contract_id, admin, _, client, _) = setup();
+    let long_id = "x".repeat((MAX_COURSE_ID_LEN + 1) as usize);
+    let course_id = sid(&env, &long_id);
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "register_course",
+        (admin.clone(), course_id.clone(), 3_u32),
+    );
+
+    let result = client.try_register_course(&admin, &course_id, &3);
+    assert_eq!(
+        result.err(),
+        Some(Ok(soroban_sdk::Error::from_contract_error(
+            Error::InvalidCourseId as u32
+        )))
+    );
+}
+
+#[test]
+fn register_course_rejects_zero_milestone_count() {
+    let (env, contract_id, admin, _, client, _) = setup();
+    let course_id = sid(&env, "course-a");
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "register_course",
+        (admin.clone(), course_id.clone(), 0_u32),
+    );
+
+    let result = client.try_register_course(&admin, &course_id, &0);
+    assert_eq!(
+        result.err(),
+        Some(Ok(soroban_sdk::Error::from_contract_error(
+            Error::InvalidMilestoneCount as u32
+        )))
+    );
+}
+
+#[test]
+fn register_course_rejects_milestone_count_above_max() {
+    let (env, contract_id, admin, _, client, _) = setup();
+    let course_id = sid(&env, "course-a");
+    let milestone_count = MAX_MILESTONE_COUNT + 1;
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "register_course",
+        (admin.clone(), course_id.clone(), milestone_count),
+    );
+
+    let result = client.try_register_course(&admin, &course_id, &milestone_count);
+    assert_eq!(
+        result.err(),
+        Some(Ok(soroban_sdk::Error::from_contract_error(
+            Error::InvalidMilestoneCount as u32
+        )))
+    );
+}
+
+#[test]
+fn register_course_rejects_duplicate_course_id() {
+    let (env, contract_id, admin, _, client, _) = setup();
+    let course_id = sid(&env, "duplicate-course");
+
+    register_course(&env, &contract_id, &admin, &client, &course_id, 3);
+    authorize(
+        &env,
+        &admin,
+        &contract_id,
+        "register_course",
+        (admin.clone(), course_id.clone(), 5_u32),
+    );
+
+    let result = client.try_register_course(&admin, &course_id, &5);
+    assert_eq!(
+        result.err(),
+        Some(Ok(soroban_sdk::Error::from_contract_error(
+            Error::AlreadyExists as u32
+        )))
+    );
+}
+
+#[test]
+fn register_course_accepts_boundary_values() {
+    let (env, contract_id, admin, _, client, _) = setup();
+    let min_id = sid(&env, "a");
+    let max_id = sid(&env, &"m".repeat(MAX_COURSE_ID_LEN as usize));
+
+    register_course(&env, &contract_id, &admin, &client, &min_id, 1);
+    register_course(
+        &env,
+        &contract_id,
+        &admin,
+        &client,
+        &max_id,
+        MAX_MILESTONE_COUNT,
+    );
+
+    assert_eq!(
+        client.get_course(&min_id),
+        Some(CourseConfig {
+            milestone_count: 1,
+            active: true,
+        })
+    );
+    assert_eq!(
+        client.get_course(&max_id),
+        Some(CourseConfig {
+            milestone_count: MAX_MILESTONE_COUNT,
+            active: true,
+        })
+    );
+}
+

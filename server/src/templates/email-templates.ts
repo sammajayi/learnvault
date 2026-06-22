@@ -138,6 +138,24 @@ export const templates: Record<string, (vars: EmailVariables) => string> = {
 			vars,
 		),
 
+	"identity-verification": (vars) =>
+		baseLayout(
+			`
+    <h2 style="color: #4f46e5;">Verify your identity</h2>
+    <p>You requested identity verification on LearnVault. Click the button below to confirm your email address.</p>
+    <p style="text-align: center;">
+      <a href="${vars.callbackUrl}" class="button primary">Verify my email</a>
+    </p>
+    <p style="font-size: 13px; color: #555;">
+      Or copy and paste this link into your browser:<br>
+      <a href="${vars.callbackUrl}" style="word-break: break-all;">${vars.callbackUrl}</a>
+    </p>
+    <p style="font-size: 12px; color: #888;">This link expires in 24 hours. If you did not request this, you can safely ignore this email.</p>
+    <p>Best,<br>The LearnVault Team</p>
+  `,
+			vars,
+		),
+
 	"admin-alert": (vars) =>
 		baseLayout(
 			`
@@ -147,6 +165,75 @@ export const templates: Record<string, (vars: EmailVariables) => string> = {
     <p>${vars.body}</p>
     <p><a href="${vars.adminUrl || "#"}" class="button accent">Review in Admin Panel</a></p>
     <p>Best,<br>LearnVault System</p>
+  `,
+			vars,
+		),
+	"milestone-approved-admin": (vars) =>
+		baseLayout(
+			`
+    <p>Hi ${vars.name},</p>
+    <p><strong>Yayy! Your milestone has been approved!</strong></p>
+    <p>Your milestone <strong>${vars.milestoneTitle}</strong> for the course <strong>${vars.courseTitle}</strong> has been approved by the admin.</p>
+    
+    <ul>
+        <li><strong>Milestone:</strong> ${vars.milestoneNumber}</li>
+        <li><strong>Reward Earned:</strong> ${vars.reward} LRN</li>
+    </ul>
+
+    <p>Keep up the great progress 🚀</p>
+
+    <p><a href="${vars.dashboardUrl}" class="button success">View Dashboard</a></p>
+
+    <p>Best,<br>The LearnVault Team</p>
+  `,
+			vars,
+		),
+
+	"milestone-rejected-admin": (vars) =>
+		baseLayout(
+			`
+    <p>Hi ${vars.name},</p>
+    <p><strong>Your milestone was not approved</strong></p>
+    <p>Your submission for <strong>${vars.milestoneTitle}</strong> in the course <strong>${vars.courseTitle}</strong> was reviewed by the admin and requires changes.</p>
+
+    <ul>
+        <li><strong>Milestone:</strong> ${vars.milestoneNumber}</li>
+    </ul>
+
+    ${
+			vars.rejectionReason
+				? `<p><strong>Reason:</strong> ${vars.rejectionReason}</p>`
+				: ""
+		}
+
+    <p>Please review the feedback and resubmit.</p>
+
+    <p><a href="${vars.milestoneUrl}" class="button warning">Update Milestone</a></p>
+
+    <p>Best,<br>The LearnVault Team</p>
+  `,
+			vars,
+		),
+	"general-notification": (vars) =>
+		baseLayout(
+			`
+    <p>Hi ${vars.name},</p>
+    <p>${vars.body}</p>
+    <p><a href="${vars.actionUrl || "#"}" class="button info">Open LearnVault</a></p>
+    <p>Best,<br>The LearnVault Team</p>
+  `,
+			vars,
+		),
+
+	"voting-deadline-reminder": (vars) =>
+		baseLayout(
+			`
+    <p>Hi ${vars.name},</p>
+    <p><strong>Voting closes in ${vars.timeRemaining}!</strong></p>
+    <p>The proposal <strong>${vars.proposalTitle}</strong> is approaching its voting deadline.</p>
+    <p>If you haven't voted yet, now is the time to make your voice heard.</p>
+    <p><a href="${vars.proposalUrl}" class="button warning">Vote Now</a></p>
+    <p>Best,<br>The LearnVault Team</p>
   `,
 			vars,
 		),

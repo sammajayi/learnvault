@@ -1,11 +1,21 @@
-import React, { useMemo, useState } from "react"
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react"
 import ReactMarkdown from "react-markdown"
 import { useNavigate } from "react-router-dom"
+import ConfirmDialog from "../components/ConfirmDialog"
 import { useToast } from "../components/Toast/ToastProvider"
+import { WalletButton } from "../components/WalletButton"
 import { useProposals } from "../hooks/useProposals"
 import { useWallet } from "../hooks/useWallet"
+import {
+	saveProposalDraft,
+	loadProposalDraft,
+	clearProposalDraft,
+	hasProposalDraft,
+	getDraftTimestamp,
+	ProposalDraft,
+} from "../util/proposalDraft"
 
-type ProposalType = "scholarship" | "parameter_change" | "new_course"
+export type ProposalType = "scholarship" | "parameter_change" | "new_course"
 
 interface FormData {
 	title: string
@@ -20,6 +30,13 @@ interface FormData {
 	courseDescription: string
 	courseDuration: string
 	courseDifficulty: string
+}
+
+interface FormErrors {
+	title?: string
+	description?: string
+	applicationUrl?: string
+	fundingAmount?: string
 }
 
 const MINIMUM_PROPOSAL_TOKENS = 10n
@@ -39,19 +56,115 @@ const initialFormData: FormData = {
 	courseDifficulty: "",
 }
 
+const isValidUrl = (value: string): boolean => {
+	if (!value) return true
+	try {
+		const url = new URL(value)
+		return url.protocol === "http:" || url.protocol === "https:"
+	} catch {
+		return false
+	}
+}
+
+const isNonEmpty = (value: string): boolean => value.trim().length > 0
+
 const DaoPropose: React.FC = () => {
 	const { address } = useWallet()
 	const navigate = useNavigate()
-	const { createProposal, isSubmittingProposal, votingPower } = useProposals()
-	const { showError } = useToast()
+	const {
+		createProposal,
+		isSubmittingProposal,
+		votingPower,
+		isLoadingVotingPower,
+		isVotingPowerError,
+	} = useProposals()
+	const { showError, showSuccess } = useToast()
 	const [activeTab, setActiveTab] = useState<"edit" | "preview">("edit")
 	const [submissionError, setSubmissionError] = useState<string | null>(null)
-	const [submissionSuccess, setSubmissionSuccess] = useState<string | null>(
+	const [formErrors, setFormErrors] = useState<FormErrors>({})
+	const [createdProposalId, setCreatedProposalId] = useState<number | null>(
 		null,
 	)
+	const [createdTxHash, setCreatedTxHash] = useState<string | null>(null)
 	const [formData, setFormData] = useState<FormData>(initialFormData)
+	const [hasDraft, setHasDraft] = useState(false)
+	const [showRestorePrompt, setShowRestorePrompt] = useState(false)
+	const [draftTimestamp, setDraftTimestamp] = useState<number | null>(null)
 
-	const hasMinimumBalance = votingPower >= MINIMUM_PROPOSAL_TOKENS
+	// Check for existing draft on mount
+	useEffect(() => {
+		const existingDraft = hasProposalDraft()
+		setHasDraft(existingDraft)
+		if (existingDraft) {
+			const timestamp = getDraftTimestamp()
+			setDraftTimestamp(timestamp)
+			setShowRestorePrompt(true)
+		}
+	}, [])
+
+	// Auto-save draft with debounce
+	useEffect(() => {
+		// Only save if there's actual content
+		const hasContent =
+			formData.title.trim() ||
+			formData.description.trim() ||
+			formData.applicationUrl.trim() ||
+			formData.fundingAmount.trim() ||
+			formData.parameterName.trim() ||
+			formData.parameterValue.trim() ||
+			formData.courseTitle.trim()
+
+		if (!hasContent) return
+
+		const timeout = setTimeout(() => {
+			saveProposalDraft(formData)
+			setHasDraft(true)
+			setDraftTimestamp(Date.now())
+		}, 500)
+
+		return () => clearTimeout(timeout)
+	}, [formData])
+
+	// Handle restore draft
+	const handleRestoreDraft = () => {
+		const draft = loadProposalDraft()
+		if (draft) {
+			const { savedAt, ...draftData } = draft
+			setFormData(draftData as FormData)
+			showSuccess("Draft restored successfully")
+		}
+		setShowRestorePrompt(false)
+	}
+
+	// Handle delete draft
+	const [showDeleteDraftConfirm, setShowDeleteDraftConfirm] = useState(false)
+
+	const handleDeleteDraft = () => {
+		clearProposalDraft()
+		setHasDraft(false)
+		setDraftTimestamp(null)
+		setShowRestorePrompt(false)
+		setShowDeleteDraftConfirm(false)
+		showSuccess("Draft deleted")
+	}
+
+	// Format draft timestamp for display
+	const formatDraftTime = (timestamp: number | null): string => {
+		if (!timestamp) return ""
+		const date = new Date(timestamp)
+		const now = new Date()
+		const diffMs = now.getTime() - date.getTime()
+		const diffMins = Math.floor(diffMs / 60000)
+
+		if (diffMins < 1) return "just now"
+		if (diffMins < 60) return `${diffMins}m ago`
+		if (diffMins < 1440) return `${Math.floor(diffMins / 60)}h ago`
+		return date.toLocaleDateString()
+	}
+	const hasMinimumBalance =
+		isLoadingVotingPower ||
+		isVotingPowerError ||
+		votingPower >= MINIMUM_PROPOSAL_TOKENS
 
 	const requestedAmount = useMemo(() => {
 		if (formData.type === "scholarship" && formData.fundingAmount.trim()) {
@@ -108,6 +221,38 @@ const DaoPropose: React.FC = () => {
 		return sections.filter(Boolean).join("\n\n")
 	}, [evidenceUrl, formData, requestedAmount])
 
+	const validateForm = (): FormErrors => {
+		const errors: FormErrors = {}
+
+		if (!isNonEmpty(formData.title)) {
+			errors.title = "Proposal title is required."
+		}
+
+		if (!isNonEmpty(formData.description)) {
+			errors.description = "Proposal description is required."
+		}
+
+		if (formData.type === "scholarship" && formData.applicationUrl.trim()) {
+			if (!isValidUrl(formData.applicationUrl.trim())) {
+				errors.applicationUrl =
+					"Please enter a valid URL starting with http:// or https://"
+			}
+		}
+
+		if (formData.type === "scholarship" && formData.fundingAmount.trim()) {
+			const amount = Number(formData.fundingAmount)
+			if (isNaN(amount) || amount < 0) {
+				errors.fundingAmount = "Funding amount must be a positive number."
+			}
+		}
+
+		return errors
+	}
+
+	const fieldErrorId = (name: string): string => `${name}-error`
+	const ariaDescribedBy = (name: string): string | undefined =>
+		formErrors[name as keyof FormErrors] ? fieldErrorId(name) : undefined
+
 	const handleInputChange = (
 		event: React.ChangeEvent<
 			HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
@@ -118,16 +263,27 @@ const DaoPropose: React.FC = () => {
 			...current,
 			[name]: value,
 		}))
+		if (name in formErrors) {
+			setFormErrors((current) => {
+				const next = { ...current }
+				delete next[name as keyof FormErrors]
+				return next
+			})
+		}
 		if (submissionError) setSubmissionError(null)
-		if (submissionSuccess) setSubmissionSuccess(null)
 	}
 
-	const handleSubmit = async (event: React.FormEvent) => {
+	const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
 		event.preventDefault()
 		if (!address || !hasMinimumBalance) return
 
+		const errors = validateForm()
+		if (Object.keys(errors).length > 0) {
+			setFormErrors(errors)
+			return
+		}
+
 		setSubmissionError(null)
-		setSubmissionSuccess(null)
 
 		try {
 			const created = await createProposal({
@@ -138,11 +294,14 @@ const DaoPropose: React.FC = () => {
 				evidence_url: evidenceUrl,
 			})
 
-			setSubmissionSuccess("Proposal submitted successfully. Redirecting...")
+			setCreatedProposalId(created.proposal_id)
+			setCreatedTxHash(created.tx_hash ?? null)
 			setFormData(initialFormData)
-			window.setTimeout(() => {
-				void navigate(`/dao/proposals?proposal=${created.proposal_id}`)
-			}, 700)
+			setFormErrors({})
+			// Clear draft after successful submission
+			clearProposalDraft()
+			setHasDraft(false)
+			setDraftTimestamp(null)
 		} catch (error) {
 			const message =
 				error instanceof Error
@@ -152,6 +311,13 @@ const DaoPropose: React.FC = () => {
 			console.error("Failed to submit proposal:", error)
 			showError(message)
 		}
+	}
+
+	const handleCreateAnother = () => {
+		setCreatedProposalId(null)
+		setCreatedTxHash(null)
+		setSubmissionError(null)
+		setFormErrors({})
 	}
 
 	const renderTypeSpecificFields = () => {
@@ -168,9 +334,24 @@ const DaoPropose: React.FC = () => {
 								name="applicationUrl"
 								value={formData.applicationUrl}
 								onChange={handleInputChange}
-								className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors"
+								aria-invalid={Boolean(formErrors.applicationUrl)}
+								aria-describedby={ariaDescribedBy("applicationUrl")}
+								className={`w-full px-4 py-3 bg-white/5 border rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors ${
+									formErrors.applicationUrl
+										? "border-red-400"
+										: "border-white/10"
+								}`}
 								placeholder="https://example.com/scholarship-application"
 							/>
+							{formErrors.applicationUrl && (
+								<p
+									id={fieldErrorId("applicationUrl")}
+									className="text-sm text-red-400 mt-1"
+									role="alert"
+								>
+									{formErrors.applicationUrl}
+								</p>
+							)}
 						</div>
 						<div>
 							<label className="block text-sm font-black uppercase tracking-widest text-white/30 mb-2">
@@ -181,10 +362,25 @@ const DaoPropose: React.FC = () => {
 								name="fundingAmount"
 								value={formData.fundingAmount}
 								onChange={handleInputChange}
-								className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors"
+								aria-invalid={Boolean(formErrors.fundingAmount)}
+								aria-describedby={ariaDescribedBy("fundingAmount")}
+								className={`w-full px-4 py-3 bg-white/5 border rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors ${
+									formErrors.fundingAmount
+										? "border-red-400"
+										: "border-white/10"
+								}`}
 								placeholder="500"
 								min="0"
 							/>
+							{formErrors.fundingAmount && (
+								<p
+									id={fieldErrorId("fundingAmount")}
+									className="text-sm text-red-400 mt-1"
+									role="alert"
+								>
+									{formErrors.fundingAmount}
+								</p>
+							)}
 						</div>
 					</div>
 				)
@@ -309,32 +505,98 @@ const DaoPropose: React.FC = () => {
 		</div>
 	)
 
-	if (!address) {
+	if (createdProposalId !== null) {
 		return (
 			<div className="min-h-screen flex items-center justify-center text-white">
-				<div className="text-center">
-					<h1 className="text-4xl font-black mb-4">Connect Your Wallet</h1>
+				<div className="glass-card p-12 rounded-[3rem] border border-white/5 text-center max-w-lg w-full">
+					<div className="w-16 h-16 mx-auto mb-6 rounded-full bg-brand-emerald/20 flex items-center justify-center">
+						<span className="text-3xl">✓</span>
+					</div>
+					<h1 className="text-4xl font-black mb-4">Proposal Submitted!</h1>
 					<p className="text-white/60 mb-8">
-						You need to connect your wallet to create a proposal.
+						Your proposal has been submitted for community review and voting.
 					</p>
+					<div className="space-y-3 mb-8">
+						<div className="p-4 rounded-xl bg-white/5 border border-white/10">
+							<span className="text-xs font-black uppercase tracking-widest text-white/30 block mb-1">
+								Proposal ID
+							</span>
+							<strong className="text-brand-cyan text-lg">
+								{createdProposalId}
+							</strong>
+						</div>
+						{createdTxHash && (
+							<div className="p-4 rounded-xl bg-white/5 border border-white/10">
+								<span className="text-xs font-black uppercase tracking-widest text-white/30 block mb-1">
+									Transaction Hash
+								</span>
+								<code className="text-sm text-white/70 break-all">
+									{createdTxHash}
+								</code>
+							</div>
+						)}
+					</div>
+					<div className="flex flex-col gap-3">
+						<button
+							onClick={() =>
+								navigate(`/dao/proposals?proposal=${createdProposalId}`)
+							}
+							className="w-full px-6 py-3 bg-brand-cyan/10 border border-brand-cyan/30 text-brand-cyan font-black uppercase tracking-widest rounded-xl hover:scale-105 active:scale-95 transition-all"
+						>
+							View Proposal
+						</button>
+						<button
+							onClick={handleCreateAnother}
+							className="w-full px-6 py-3 bg-white/5 border border-white/10 text-white/60 font-black uppercase tracking-widest rounded-xl hover:bg-white/10 transition-all"
+						>
+							Create Another Proposal
+						</button>
+					</div>
 				</div>
 			</div>
 		)
 	}
 
-	if (!hasMinimumBalance) {
+	if (!address) {
 		return (
-			<div className="min-h-screen flex items-center justify-center text-white">
-				<div className="glass-card p-12 rounded-[3rem] border border-white/5 text-center max-w-md">
-					<h1 className="text-4xl font-black mb-4">
-						Insufficient Governance Tokens
-					</h1>
-					<p className="text-white/60 mb-6">
-						You need at least {MINIMUM_PROPOSAL_TOKENS.toString()} governance
-						tokens to create a proposal.
-					</p>
-					<div className="text-brand-cyan text-2xl font-bold mb-8">
-						Current Balance: {votingPower.toString()} GOV
+			<div className="flex items-center justify-center py-32 text-white">
+				<div className="glass-card p-12 rounded-3xl border border-white/8 text-center max-w-md w-full flex flex-col items-center gap-6">
+					<span className="text-5xl">🔐</span>
+					<div>
+						<h1 className="text-2xl font-black mb-2">Connect Your Wallet</h1>
+						<p className="text-white/50 text-sm leading-relaxed">
+							You need to connect your wallet to create a governance proposal.
+						</p>
+					</div>
+					<WalletButton />
+				</div>
+			</div>
+		)
+	}
+
+	if (!isLoadingVotingPower && !isVotingPowerError && !hasMinimumBalance) {
+		return (
+			<div className="flex items-center justify-center py-32 text-white">
+				<div className="glass-card p-12 rounded-3xl border border-white/8 text-center max-w-md w-full flex flex-col items-center gap-6">
+					<span className="text-5xl">⚖️</span>
+					<div>
+						<h1 className="text-2xl font-black mb-2">
+							Insufficient Governance Tokens
+						</h1>
+						<p className="text-white/50 text-sm leading-relaxed mb-4">
+							You need at least{" "}
+							<span className="text-brand-cyan font-bold">
+								{MINIMUM_PROPOSAL_TOKENS.toString()} GOV
+							</span>{" "}
+							to create a proposal. Complete courses to earn LRN and governance
+							tokens.
+						</p>
+						<p className="text-sm text-white/30">
+							Your balance:{" "}
+							<span className="text-white/60 font-bold">
+								{votingPower.toString()} GOV
+							</span>
+						</p>
 					</div>
 				</div>
 			</div>
@@ -343,15 +605,76 @@ const DaoPropose: React.FC = () => {
 
 	return (
 		<div className="min-h-screen text-white">
-			<div className="p-12 max-w-4xl mx-auto">
+			{showDeleteDraftConfirm && (
+				<ConfirmDialog
+					title="Delete Draft"
+					description="Are you sure you want to delete your proposal draft? All your progress will be permanently lost. This action cannot be undone."
+					confirmLabel="Delete Draft"
+					cancelLabel="Keep Draft"
+					onConfirm={handleDeleteDraft}
+					onCancel={() => setShowDeleteDraftConfirm(false)}
+					isDestructive
+				/>
+			)}
+			<div className="p-6 md:p-12 max-w-4xl mx-auto">
 				<header className="mb-12">
-					<h1 className="text-6xl font-black mb-4 tracking-tighter text-gradient">
-						Create Proposal
-					</h1>
+					<div className="flex items-center gap-4 mb-4">
+						<h1 className="text-6xl font-black tracking-tighter text-gradient">
+							Create Proposal
+						</h1>
+						{hasDraft && (
+							<span className="inline-flex items-center gap-2 px-3 py-1 bg-brand-amber/20 border border-brand-amber/40 text-brand-amber text-xs font-black uppercase tracking-widest rounded-full">
+								<span className="w-2 h-2 bg-brand-amber rounded-full animate-pulse" />
+								Draft
+								{draftTimestamp && (
+									<span className="text-brand-amber/60">
+										({formatDraftTime(draftTimestamp)})
+									</span>
+								)}
+							</span>
+						)}
+					</div>
 					<p className="text-white/40 text-lg font-medium max-w-2xl">
 						Submit a governance proposal to the backend API for community review
 						and voting.
 					</p>
+					{hasDraft && !showRestorePrompt && (
+						<button
+							type="button"
+							onClick={() => setShowDeleteDraftConfirm(true)}
+							className="mt-4 text-sm text-white/40 hover:text-red-400 transition-colors"
+						>
+							✕ Delete draft
+						</button>
+					)}
+
+					{showRestorePrompt && (
+						<div className="mt-6 p-4 rounded-xl bg-brand-amber/10 border border-brand-amber/30">
+							<p className="text-sm text-white mb-4">
+								You have an unsaved draft from{" "}
+								<span className="text-brand-amber">
+									{draftTimestamp && formatDraftTime(draftTimestamp)}
+								</span>
+								. Would you like to restore it?
+							</p>
+							<div className="flex gap-3">
+								<button
+									type="button"
+									onClick={handleRestoreDraft}
+									className="px-4 py-2 bg-brand-amber/20 border border-brand-amber/40 text-brand-amber font-black uppercase tracking-widest text-sm rounded-lg hover:bg-brand-amber/30 transition-all"
+								>
+									Restore Draft
+								</button>
+								<button
+									type="button"
+									onClick={() => setShowDeleteDraftConfirm(true)}
+									className="px-4 py-2 bg-white/5 border border-white/10 text-white/60 font-black uppercase tracking-widest text-sm rounded-lg hover:bg-white/10 transition-all"
+								>
+									Discard
+								</button>
+							</div>
+						</div>
+					)}
 				</header>
 
 				<form onSubmit={handleSubmit} className="space-y-8">
@@ -375,7 +698,7 @@ const DaoPropose: React.FC = () => {
 
 							<div>
 								<label className="block text-sm font-black uppercase tracking-widest text-white/30 mb-2">
-									Title (max 100 characters)
+									Proposal Title <span className="text-red-400">*</span>
 								</label>
 								<input
 									type="text"
@@ -384,11 +707,33 @@ const DaoPropose: React.FC = () => {
 									onChange={handleInputChange}
 									maxLength={100}
 									required
-									className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors"
+									aria-required="true"
+									aria-invalid={Boolean(formErrors.title)}
+									aria-describedby={ariaDescribedBy("title")}
+									className={`w-full px-4 py-3 bg-white/5 border rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors ${
+										formErrors.title ? "border-red-400" : "border-white/10"
+									}`}
 									placeholder="Enter proposal title"
 								/>
-								<div className="text-right mt-1">
-									<span className="text-xs text-white/40">
+								<div className="flex justify-between items-center mt-1">
+									{formErrors.title ? (
+										<p
+											id={fieldErrorId("title")}
+											className="text-sm text-red-400"
+											role="alert"
+										>
+											{formErrors.title}
+										</p>
+									) : (
+										<span />
+									)}
+									<span
+										className={`text-xs ${
+											formData.title.length > 90
+												? "text-yellow-400"
+												: "text-white/40"
+										}`}
+									>
 										{formData.title.length}/100
 									</span>
 								</div>
@@ -397,7 +742,7 @@ const DaoPropose: React.FC = () => {
 							<div>
 								<div className="flex justify-between items-center mb-2">
 									<label className="block text-sm font-black uppercase tracking-widest text-white/30">
-										Description (max 2000 characters)
+										Proposal Description <span className="text-red-400">*</span>
 									</label>
 									<div className="flex gap-2">
 										<button
@@ -432,12 +777,36 @@ const DaoPropose: React.FC = () => {
 											onChange={handleInputChange}
 											maxLength={2000}
 											required
+											aria-required="true"
+											aria-invalid={Boolean(formErrors.description)}
+											aria-describedby={ariaDescribedBy("description")}
 											rows={8}
-											className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors resize-none"
+											className={`w-full px-4 py-3 bg-white/5 border rounded-xl text-white placeholder-white/40 focus:border-brand-cyan/40 focus:outline-none transition-colors resize-none ${
+												formErrors.description
+													? "border-red-400"
+													: "border-white/10"
+											}`}
 											placeholder="Enter the proposal details using Markdown formatting"
 										/>
-										<div className="text-right mt-1">
-											<span className="text-xs text-white/40">
+										<div className="flex justify-between items-center mt-1">
+											{formErrors.description ? (
+												<p
+													id={fieldErrorId("description")}
+													className="text-sm text-red-400"
+													role="alert"
+												>
+													{formErrors.description}
+												</p>
+											) : (
+												<span />
+											)}
+											<span
+												className={`text-xs ${
+													formData.description.length > 1900
+														? "text-yellow-400"
+														: "text-white/40"
+												}`}
+											>
 												{formData.description.length}/2000
 											</span>
 										</div>
@@ -469,11 +838,10 @@ const DaoPropose: React.FC = () => {
 							Requested amount:{" "}
 							<span className="text-brand-cyan">{requestedAmount} USDC</span>
 						</p>
-						{submissionSuccess && (
-							<p className="text-sm text-brand-emerald">{submissionSuccess}</p>
-						)}
 						{submissionError && (
-							<p className="text-sm text-red-400">{submissionError}</p>
+							<p className="text-sm text-red-400" role="alert">
+								{submissionError}
+							</p>
 						)}
 					</div>
 
@@ -498,12 +866,18 @@ const DaoPropose: React.FC = () => {
 								disabled={
 									isSubmittingProposal ||
 									!formData.title.trim() ||
-									!formData.description.trim() ||
-									!hasMinimumBalance
+									!formData.description.trim()
 								}
-								className="px-8 py-3 bg-brand-cyan/10 border border-brand-cyan/30 text-brand-cyan font-black uppercase tracking-widest rounded-xl disabled:opacity-50 disabled:cursor-not-allowed hover:scale-105 active:scale-95 transition-all"
+								className="px-8 py-3 bg-brand-cyan/10 border border-brand-cyan/30 text-brand-cyan font-black uppercase tracking-widest rounded-xl disabled:opacity-50 disabled:cursor-not-allowed hover:scale-105 active:scale-95 transition-all flex items-center justify-center gap-3"
 							>
-								{isSubmittingProposal ? "Submitting..." : "Submit Proposal"}
+								{isSubmittingProposal ? (
+									<>
+										<span className="w-4 h-4 border-2 border-brand-cyan/30 border-t-brand-cyan rounded-full animate-spin" />
+										Submitting...
+									</>
+								) : (
+									"Submit Proposal"
+								)}
 							</button>
 						</div>
 					</div>

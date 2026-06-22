@@ -2,8 +2,10 @@ import { type Api } from "@stellar/stellar-sdk/rpc"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useCallback } from "react"
 import { useToast } from "../components/Toast/ToastProvider"
+import { type LearnTokenInfo } from "../types/contracts"
 import { ErrorCode, createAppError } from "../types/errors"
 import { parseError, isUserRejection } from "../utils/errors"
+import { logger } from "../utils/logger"
 import { useContractIds } from "./useContractIds"
 import { useSubscription } from "./useSubscription"
 import { useWallet } from "./useWallet"
@@ -23,7 +25,7 @@ const generatedContractModules = import.meta.glob("../contracts/*.ts")
 const loadLearnTokenClient = async (): Promise<ContractRecord | null> => {
 	const moduleLoader = generatedContractModules["../contracts/learn_token.ts"]
 	if (!moduleLoader) {
-		console.warn(
+		logger.warn(
 			createAppError(
 				ErrorCode.CONTRACT_NOT_DEPLOYED,
 				"LearnToken contract module not found",
@@ -38,7 +40,7 @@ const loadLearnTokenClient = async (): Promise<ContractRecord | null> => {
 
 		return (mod.default as ContractRecord) ?? mod
 	} catch (err) {
-		console.warn(
+		logger.warn(
 			createAppError(
 				ErrorCode.CONTRACT_NOT_DEPLOYED,
 				"Failed to load LearnToken contract",
@@ -93,7 +95,7 @@ const toBigInt = (value: unknown): bigint => {
 // Prefix used to invalidate all balance entries at once (e.g. after any mint).
 const BALANCE_QUERY_KEY_PREFIX = ["learnToken", "balance"] as const
 
-const BALANCE_STALE_TIME = 5 * 60 * 1000 // 5 minutes
+const BALANCE_STALE_TIME = 30 * 1000 // 30 seconds
 
 // The expected contract version this client was generated against.
 const EXPECTED_CONTRACT_VERSION = "1.0.0"
@@ -153,7 +155,7 @@ export function useLearnToken(address?: string): UseLearnTokenResult {
 				const raw = await fn({})
 				const version = String(unwrapResult(raw) ?? "")
 				if (version && version !== EXPECTED_CONTRACT_VERSION) {
-					console.warn(
+					logger.warn(
 						`[LearnToken] Version mismatch: expected ${EXPECTED_CONTRACT_VERSION}, got ${version}. ` +
 							"Client bindings may be out of date.",
 					)
@@ -302,4 +304,82 @@ export function useLearnToken(address?: string): UseLearnTokenResult {
 		mint,
 		isMinting,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// useLrnTotalForLinkedWallets
+// ---------------------------------------------------------------------------
+
+export interface UseLrnTotalResult {
+	/** Sum of LRN balances across all supplied addresses. */
+	total: number
+	isLoading: boolean
+}
+
+/**
+ * Returns the total LRN balance across a set of linked wallet addresses.
+ * Each address is queried independently via `useLearnToken`; the results are
+ * summed into a single `total` value expressed as a plain number.
+ *
+ * Renders a stable result even when the address list is empty (total = 0).
+ */
+export function useLrnTotalForLinkedWallets(
+	addresses: string[],
+): UseLrnTotalResult {
+	// We call useLearnToken up to a fixed maximum so the hook count never
+	// varies at runtime (Rules of Hooks).  Unused slots return balance=0n.
+	const MAX_WALLETS = 20
+	const slots = Array.from(
+		{ length: MAX_WALLETS },
+		(_, i) => addresses[i] ?? undefined,
+	)
+
+	const r0 = useLearnToken(slots[0])
+	const r1 = useLearnToken(slots[1])
+	const r2 = useLearnToken(slots[2])
+	const r3 = useLearnToken(slots[3])
+	const r4 = useLearnToken(slots[4])
+	const r5 = useLearnToken(slots[5])
+	const r6 = useLearnToken(slots[6])
+	const r7 = useLearnToken(slots[7])
+	const r8 = useLearnToken(slots[8])
+	const r9 = useLearnToken(slots[9])
+	const r10 = useLearnToken(slots[10])
+	const r11 = useLearnToken(slots[11])
+	const r12 = useLearnToken(slots[12])
+	const r13 = useLearnToken(slots[13])
+	const r14 = useLearnToken(slots[14])
+	const r15 = useLearnToken(slots[15])
+	const r16 = useLearnToken(slots[16])
+	const r17 = useLearnToken(slots[17])
+	const r18 = useLearnToken(slots[18])
+	const r19 = useLearnToken(slots[19])
+
+	const results = [
+		r0,
+		r1,
+		r2,
+		r3,
+		r4,
+		r5,
+		r6,
+		r7,
+		r8,
+		r9,
+		r10,
+		r11,
+		r12,
+		r13,
+		r14,
+		r15,
+		r16,
+		r17,
+		r18,
+		r19,
+	].slice(0, addresses.length)
+
+	const isLoading = results.some((r) => r.isLoading)
+	const total = results.reduce((sum, r) => sum + Number(r.balance ?? 0n), 0)
+
+	return { total, isLoading }
 }

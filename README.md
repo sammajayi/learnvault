@@ -8,6 +8,10 @@
 
 [![Contracts CI](https://github.com/robertocarlous/learnvault/actions/workflows/contracts-ci.yml/badge.svg)](https://github.com/robertocarlous/learnvault/actions/workflows/contracts-ci.yml)
 [![Frontend CI](https://github.com/bakeronchain/learnvault/actions/workflows/frontend-ci.yml/badge.svg)](https://github.com/bakeronchain/learnvault/actions/workflows/frontend-ci.yml)
+[![Build](https://github.com/bakeronchain/learnvault/actions/workflows/build.yml/badge.svg)](https://github.com/bakeronchain/learnvault/actions/workflows/build.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Built on Stellar](https://img.shields.io/badge/Built%20on-Stellar-purple)](https://stellar.org)
+[![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](https://github.com/bakeronchain/learnvault/issues)
 
 > **Learning is the proof of work. The community is the bank.**
 
@@ -27,10 +31,11 @@
 10. [Tech Stack](#tech-stack)
 11. [Roadmap](#roadmap)
 12. [Whitepaper Generation](#whitepaper-generation)
-13. [Running Tests](#running-tests)
-14. [Contributing](#contributing)
-15. [Resources](#resources)
-16. [Contact](#contact)
+13. [Setup](#setup)
+14. [Running Tests](#running-tests)
+15. [Contributing](#contributing)
+16. [Resources](#resources)
+17. [Contact](#contact)
 
 ---
 
@@ -106,7 +111,7 @@ stablecoins — real, stable value delivered directly to their wallets.
 │   │ Courses  │    │ LRN      │    │ Scholarship│    │
 │   │ Quizzes  │    │ Tokens   │    │ Proposals │     │
 │   │ Projects │    │ (Soulbound│   │ DAO Vote  │     │
-│   │          │    │ ERC20)   │    │ Escrow    │     │
+│   │          │    │ SEP-41)  │    │ Escrow    │     │
 │   └──────────┘    └──────────┘    └──────────┘     │
 │                                                     │
 │   ┌─────────────────────────────────────────┐       │
@@ -122,41 +127,42 @@ stablecoins — real, stable value delivered directly to their wallets.
 
 LearnVault is powered by six core smart contracts:
 
-### `LearnToken.sol`
+### `learn_token`
 
-A **soulbound ERC20** token that is minted to learners upon verified milestone
-completion. Non-transferable by design — it represents real effort, not
-speculation. Your LearnToken balance is your on-chain academic reputation score.
+A **soulbound SEP-41 fungible token** that is minted to learners upon verified
+milestone completion. Non-transferable by design — it represents real effort,
+not speculation. Your LearnToken balance is your on-chain academic reputation
+score.
 
-### `GovernanceToken.sol`
+### `governance_token`
 
-A **transferable ERC20** distributed to donors upon treasury contribution and
-earned by top learners at milestone thresholds. Used exclusively for DAO voting
-on scholarship proposals.
+A **transferable SEP-41 fungible token** distributed to donors upon treasury
+contribution and earned by top learners at milestone thresholds. Used
+exclusively for DAO voting on scholarship proposals.
 
-### `CourseMilestone.sol`
+### `course_milestone`
 
 Tracks learner progress per course. Each course has defined checkpoints verified
 by a trusted multi-sig validator (transitioning to oracle-based verification in
 V2). On successful verification, this contract triggers LearnToken minting.
 
-### `ScholarshipTreasury.sol`
+### `scholarship_treasury`
 
 Holds all donor funds in stablecoins (USDC). Funds can only be released upon
 successful proposal execution through the governance system. Tracks total
 contributions per donor. Transparent and auditable by anyone.
 
-### `MilestoneEscrow.sol`
+### `milestone_escrow`
 
 Manages approved scholarship disbursements in tranches. Funds are released as
 scholars hit agreed milestones. If a scholar is inactive for 30 days, unspent
 funds automatically return to the treasury.
 
-### `ScholarNFT.sol`
+### `scholar_nft`
 
-Mints a **soulbound ERC721 credential** to scholars who complete their funded
-programs. Non-transferable, tamper-proof, and permanently verifiable on-chain.
-Shareable with employers, DAOs, and the broader ecosystem.
+Mints a **soulbound SEP-41 NFT credential** to scholars who complete their
+funded programs. Non-transferable, tamper-proof, and permanently verifiable
+on-chain. Shareable with employers, DAOs, and the broader ecosystem.
 
 ## Contract Interaction Flow
 
@@ -304,7 +310,7 @@ resubmitted after 30 days.
 
 ### Disbursement
 
-Approved funds are locked in `MilestoneEscrow.sol` and released in tranches as
+Approved funds are locked in `milestone_escrow` and released in tranches as
 the scholar completes agreed milestones. Progress is reported by the scholar and
 confirmed by a community-elected validator committee (transitioning to oracle
 verification in V2).
@@ -314,6 +320,33 @@ verification in V2).
 Scholars who abandon funded programs without communication are flagged on-chain.
 Repeated abandonment affects future proposal eligibility. Unspent funds always
 return to the treasury.
+
+---
+
+## Oracle-based milestone verification
+
+When a milestone is backed by a GitHub pull request, LearnVault corroborates the
+learner's claimed proof-of-work automatically instead of relying purely on
+manual review:
+
+- **On submission** — `POST /api/milestones/submit` runs the GitHub oracle in
+  the background and stores the result on the report (`oracle_verified`,
+  `oracle_evidence_hash`, `oracle_detail`).
+- **Checks performed** — the PR is fetched from the GitHub API and validated to
+  be (1) **merged**, (2) **authored by the learner's linked GitHub account**
+  (from their profile), and (3) **merged within the milestone window** (after the
+  milestone was created, on/before the submission time).
+- **Gating approval** — `POST /api/admin/milestones/:id/approve` re-runs the
+  oracle before the on-chain `verify_milestone()` call that releases escrow. A
+  failed or unavailable check returns `422` with the reasons; an admin may
+  override with `{"overrideOracle": true}`.
+- **On demand** — `POST /api/admin/milestones/:id/verify-oracle` returns the
+  verification result without changing state.
+- **CLI** — `scripts/oracle/verify-github-evidence.mjs <pr-url> [--login <user>]
+  [--window-start <iso>] [--window-end <iso>]` runs the same rules manually
+  (shared with the server via `scripts/oracle/github-evidence-core.mjs`).
+
+Set `GITHUB_TOKEN` to raise GitHub API rate limits and read private PRs.
 
 ---
 
@@ -337,10 +370,10 @@ transfers to token holders.
 
 | Layer              | Technology                                     |
 | ------------------ | ---------------------------------------------- |
-| Blockchain         | Stellar (primary), EVM-compatible L2 (planned) |
-| Smart Contracts    | Solidity / Stellar Soroban                     |
-| Frontend           | Next.js, TypeScript, TailwindCSS               |
-| Wallet Integration | Freighter (Stellar), MetaMask                  |
+| Blockchain         | Stellar                                        |
+| Smart Contracts    | Rust (Stellar Soroban)                         |
+| Frontend           | React 19, TypeScript, Stellar Design System    |
+| Wallet Integration | Freighter (Stellar)                            |
 | Storage            | IPFS (course content + proposal docs)          |
 | Stablecoin         | USDC                                           |
 | Backend            | Node.js, PostgreSQL                            |
@@ -361,7 +394,10 @@ transfers to token holders.
 
 - MilestoneEscrow and automated tranche disbursements
 - ScholarNFT credential system
-- Oracle-based milestone verification
+- Oracle-based milestone verification — GitHub proof-of-work (PR merged, authored
+  by the learner's linked account, within the milestone window) is verified on
+  submission and re-checked to gate milestone approval / escrow release. See
+  [Oracle verification](#oracle-based-milestone-verification).
 - Expanded course catalog (Web3, DeFi, Smart Contracts, ZK basics)
 - Mobile-responsive frontend
 - Community leaderboard
@@ -399,6 +435,64 @@ two-step build process:
 
 ---
 
+## Setup
+
+1. Install dependencies for the frontend and server:
+
+   ```bash
+   npm install
+   cd server && npm install
+   ```
+
+2. Copy the environment templates before starting local services:
+
+   ```bash
+   cp .env.example .env
+   cp server/.env.example server/.env
+   ```
+
+3. Fill in deployed contract IDs, Pinata credentials, and any server secrets you
+   need for your local workflow.
+
+## Quick Start with Docker
+
+Use Docker Compose when you want the frontend, API, PostgreSQL, Redis, and a
+local Stellar Quickstart node to come up together.
+
+1. Copy the environment templates:
+
+   ```bash
+   cp .env.example .env
+   cp server/.env.example server/.env
+   ```
+
+2. Start the full local stack:
+
+   ```bash
+   npm run dev:docker
+   ```
+
+3. Open the services:
+   - Frontend: `http://localhost:5173`
+   - API health: `http://localhost:3001/api/health`
+   - Postgres: `localhost:5432`
+   - Stellar Quickstart / Horizon: `http://localhost:8000`
+   - Soroban RPC: `http://localhost:8000/rpc`
+
+4. Tear everything down and remove local volumes when you want a clean reset:
+
+   ```bash
+   npm run dev:docker:clean
+   ```
+
+Notes:
+- The frontend service is defined behind the `frontend` Compose profile so
+  contributors can skip it and run Vite natively with `docker compose up api postgres redis stellar-quickstart`.
+- Host ports are configurable through the `DEV_DOCKER_*` values in
+  `.env.example`.
+
+---
+
 ## Running Tests
 
 ### Prerequisites
@@ -420,8 +514,11 @@ two-step build process:
 3. **Configure Environment:**
 
    ```bash
-   # Copy environment template
+   # Copy the root environment template
    cp .env.example .env
+
+   # Copy the server environment template
+   cp server/.env.example server/.env
 
    # Edit .env with your configuration
    # Set STELLAR_SCAFFOLD_ENV=testnet for testnet deployment
@@ -434,6 +531,19 @@ npm test                 # runs all Soroban contract tests
 npm run test:contracts   # alias for the above
 npm run test:watch       # re-runs tests on file changes
 ```
+
+### Lint and Format Contracts
+
+Before submitting a PR, ensure Rust contracts pass formatting and lint checks:
+
+```bash
+cargo fmt --all               # auto-format all contracts
+cargo fmt --all -- --check    # check formatting without modifying files (used in CI)
+cargo clippy --workspace -- -D warnings  # lint all contracts (warnings are errors)
+```
+
+Formatting rules are defined in `.rustfmt.toml` at the repo root
+(`edition = "2024"`, `max_width = 100`).
 
 ---
 
@@ -462,6 +572,8 @@ expect all participants to uphold these standards.
 
 - [Glossary](docs/glossary.md) — Key terms, tokens, and contracts explained in
   plain English
+- [Contract events](docs/contract-events.md) — Documented on-chain event names,
+  payloads, and example payloads for the indexer
 
 ---
 

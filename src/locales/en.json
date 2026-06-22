@@ -7,10 +7,12 @@
 		"viewDocs": "View docs",
 		"debug": "Debug Contracts",
 		"learn": "Learn",
+		"dashboard": "Dashboard",
 		"dao": "DAO",
 		"leaderboard": "Leaderboard",
 		"profile": "My Profile",
 		"courses": "Courses",
+		"treasury": "Treasury",
 		"discord": "Discord",
 		"twitter": "Twitter",
 		"docs": "Docs"

@@ -9,7 +9,13 @@ import {
 	getGovernanceProposals,
 	getVotingPower,
 } from "../controllers/governance.controller"
+import {
+	burnLRNForGovernance,
+	getBurnHistory,
+	getGovernanceIncentives,
+} from "../controllers/lrn-burn.controller"
 import { requireAdmin } from "../middleware/admin.middleware"
+import { authMiddleware } from "../middleware/auth.middleware"
 
 export const governanceRouter = Router()
 
@@ -25,7 +31,7 @@ export const governanceRouter = Router()
  *         name: status
  *         schema:
  *           type: string
- *           enum: [pending, approved, rejected]
+ *           enum: [pending, approved, queued, rejected]
  *         description: Filter proposals by status
  *       - in: query
  *         name: page
@@ -205,4 +211,17 @@ governanceRouter.get("/proposals/:id/status", (req, res) => {
  */
 governanceRouter.delete("/proposals/:id", requireAdmin, (req, res) => {
 	void cancelProposal(req, res)
+})
+
+// LRN Token Burn Mechanism endpoints (legacy paths; prefer POST /api/lrn/burn)
+governanceRouter.post("/governance/burn-lrn", authMiddleware, (req, res) => {
+	void burnLRNForGovernance(req, res)
+})
+
+governanceRouter.get("/governance/burn-history", authMiddleware, (req, res) => {
+	void getBurnHistory(req, res)
+})
+
+governanceRouter.get("/governance/incentives", authMiddleware, (req, res) => {
+	void getGovernanceIncentives(req, res)
 })

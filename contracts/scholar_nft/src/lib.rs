@@ -2,15 +2,23 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, String, Symbol,
+    Address, BytesN, Env, String, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
+    panic_with_error, symbol_short,
 };
+
+// ---------------------------------------------------------------------------
+// Storage Constants (assuming ~6s ledger time)
+// ---------------------------------------------------------------------------
 
 const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP_THRESHOLD: u32 = DAY_IN_LEDGERS;
-const INSTANCE_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
+const INSTANCE_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30; // 30 days
 const TTL_MIN: u32 = DAY_IN_LEDGERS;
-const TTL_MAX: u32 = DAY_IN_LEDGERS * 365;
+const TTL_MAX: u32 = DAY_IN_LEDGERS * 365; // 1 year
+
+use learnvault_shared::upgrade;
+
+pub use upgrade::ContractUpgraded;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const TOKEN_COUNTER_KEY: Symbol = symbol_short!("TCOUNTER");
@@ -81,6 +89,7 @@ pub enum ScholarNFTError {
     TokenExists = 6,
     Soulbound = 7,
     AlreadyRevoked = 8,
+    CounterOverflow = 9,
 }
 
 #[contract]
@@ -94,14 +103,13 @@ impl ScholarNFT {
         }
         admin.require_auth();
         env.storage().instance().set(&ADMIN_KEY, &admin);
+        upgrade::init(&env);
         env.storage().instance().set(&TOKEN_COUNTER_KEY, &0_u64);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Counter, &0_u64);
 
-        env.events().publish(
-            (symbol_short!("init"),),
-            InitializedEventData { admin },
-        );
+        env.events()
+            .publish((symbol_short!("init"),), InitializedEventData { admin });
 
         Self::extend_instance(&env);
     }
@@ -197,6 +205,17 @@ impl ScholarNFT {
         }
     }
 
+    pub fn get_metadata_uri(env: Env, token_id: u64) -> String {
+        Self::extend_instance(&env);
+        let key = DataKey::TokenUri(token_id);
+        if let Some(uri) = env.storage().persistent().get::<_, String>(&key) {
+            Self::extend_persistent(&env, &key);
+            uri
+        } else {
+            panic_with_error!(&env, ScholarNFTError::TokenNotFound);
+        }
+    }
+
     pub fn get_metadata(env: Env, token_id: u64) -> ScholarMetadata {
         Self::extend_instance(&env);
         let key = DataKey::Metadata(token_id);
@@ -216,6 +235,30 @@ impl ScholarNFT {
             .unwrap_or(0_u64)
     }
 
+    pub fn get_all_scholars(env: Env) -> Vec<Address> {
+        Self::extend_instance(&env);
+        let count = Self::token_counter(env.clone());
+        let mut scholars = Vec::new(&env);
+        for i in 1..=count {
+            if let Some(owner) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::Owner(i))
+            {
+                scholars.push_back(owner);
+                Self::extend_persistent(&env, &DataKey::Owner(i));
+            }
+        }
+        scholars
+    }
+
+    /// Replace the current contract WASM with a new uploaded hash. Admin only.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin = Self::get_admin(&env);
+        admin.require_auth();
+        upgrade::apply(&env, &admin, &new_wasm_hash);
+    }
+
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) {
         env.events().publish(
             (symbol_short!("xfer_att"),),
@@ -231,7 +274,7 @@ impl ScholarNFT {
             Self::extend_persistent(&env, &revoked_key);
             panic_with_error!(&env, ScholarNFTError::TokenRevoked);
         }
-
+ 
         let key = DataKey::Owner(token_id);
         if let Some(owner) = env.storage().persistent().get::<_, Address>(&key) {
             Self::extend_persistent(&env, &key);
@@ -283,7 +326,9 @@ impl ScholarNFT {
             .instance()
             .get(&TOKEN_COUNTER_KEY)
             .unwrap_or(0_u64);
-        counter = counter.saturating_add(1);
+        counter = counter
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(env, ScholarNFTError::CounterOverflow));
         env.storage().instance().set(&TOKEN_COUNTER_KEY, &counter);
         counter
     }
@@ -303,11 +348,12 @@ impl ScholarNFT {
     }
 
     fn extend_persistent(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, TTL_MIN, TTL_MAX);
+        env.storage().persistent().extend_ttl(key, TTL_MIN, TTL_MAX);
     }
 }
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod tests;

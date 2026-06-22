@@ -1,13 +1,21 @@
 import { Router, type Response } from "express"
 import sanitizeHtml from "sanitize-html"
 import { pool } from "../db/index"
-import { createCommentBodySchema } from "../lib/zod-schemas"
+import {
+	createCommentBodySchema,
+	updateCommentBodySchema,
+} from "../lib/zod-schemas"
 import {
 	createRequireAuth,
 	type AuthRequest,
 } from "../middleware/auth.middleware"
 import { validate } from "../middleware/validate.middleware"
 import { type JwtService } from "../services/jwt.service"
+
+const VOTE_COLUMN: Record<string, string> = {
+	upvote: "upvotes",
+	downvote: "downvotes",
+}
 
 export function createCommentsRouter(jwtService: JwtService): Router {
 	const router = Router()
@@ -35,14 +43,27 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 	 */
 	router.get("/proposals/:proposalId/comments", async (req, res) => {
 		const { proposalId } = req.params
+		const pageParam = parseInt(req.query.page as string) || 1
 		const limit = Math.min(parseInt(req.query.limit as string) || 50, 100)
-		const offset = Math.max(parseInt(req.query.offset as string) || 0, 0)
+		const offsetParam = parseInt(req.query.offset as string)
+		const offset = !isNaN(offsetParam) && offsetParam >= 0 ? offsetParam : (pageParam - 1) * limit
+		const page = !isNaN(offsetParam) && offsetParam >= 0 ? Math.floor(offset / limit) + 1 : pageParam
+
 		try {
+			const countResult = await pool.query(
+				`SELECT COUNT(*)::int as count FROM comments WHERE proposal_id = $1 AND deleted_at IS NULL`,
+				[proposalId],
+			)
+			const total = countResult.rows[0]?.count || 0
+
 			const result = await pool.query(
-				`SELECT * FROM comments WHERE proposal_id = $1 AND deleted_at IS NULL ORDER BY is_pinned DESC, created_at ASC LIMIT $2 OFFSET $3`,
+				`SELECT * FROM comments WHERE proposal_id = $1 AND deleted_at IS NULL AND id NOT IN (SELECT content_id FROM flagged_content WHERE content_type = 'comment' AND is_hidden = TRUE) ORDER BY is_pinned DESC, created_at ASC LIMIT $2 OFFSET $3`,
 				[proposalId, limit, offset],
 			)
-			res.json(result.rows)
+			res.json({
+				data: result.rows,
+				pagination: { page, limit, total },
+			})
 		} catch (err) {
 			res.status(500).json({ error: "Failed to fetch comments" })
 		}
@@ -55,6 +76,17 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 	 *     summary: Post a new comment
 	 *     tags: [Comments]
 	 *     security: [{ bearerAuth: [] }]
+	 *     responses:
+	 *       201:
+	 *         description: Comment created
+	 *       400:
+	 *         $ref: '#/components/responses/BadRequestError'
+	 *       401:
+	 *         $ref: '#/components/responses/UnauthorizedError'
+	 *       429:
+	 *         description: Rate limited
+	 *       500:
+	 *         $ref: '#/components/responses/InternalServerError'
 	 */
 	router.post(
 		"/comments",
@@ -112,12 +144,9 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 
 			try {
 				const globalSpamCheck = await pool.query(
-					`SELECT COUNT(*) FROM comments
-       WHERE author_address = $1
-       AND created_at > NOW() - INTERVAL '1 day'`,
+					`SELECT COUNT(*) FROM comments WHERE author_address = $1 AND created_at > NOW() - INTERVAL '1 day'`,
 					[authorAddress],
 				)
-
 				if (parseInt(globalSpamCheck.rows[0].count) >= maxCommentsPerDay) {
 					return res
 						.status(429)
@@ -126,12 +155,9 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 
 				// Spam protection: max 5 comments per address per proposal per day
 				const spamCheck = await pool.query(
-					`SELECT COUNT(*) FROM comments 
-       WHERE author_address = $1 AND proposal_id = $2 
-       AND created_at > NOW() - INTERVAL '1 day'`,
+					`SELECT COUNT(*) FROM comments WHERE author_address = $1 AND proposal_id = $2 AND created_at > NOW() - INTERVAL '1 day'`,
 					[authorAddress, proposalId],
 				)
-
 				if (parseInt(spamCheck.rows[0].count) >= 5) {
 					return res
 						.status(429)
@@ -139,14 +165,58 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 				}
 
 				const result = await pool.query(
-					`INSERT INTO comments (proposal_id, author_address, content, parent_id) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
+					`INSERT INTO comments (proposal_id, author_address, content, parent_id) VALUES ($1, $2, $3, $4) RETURNING *`,
 					[proposalId, authorAddress, safeContent, parentId ?? null],
 				)
-
 				res.status(201).json(result.rows[0])
 			} catch (err) {
 				res.status(500).json({ error: "Failed to post comment" })
+			}
+		},
+	)
+
+	/**
+	 * @openapi
+	 * /api/comments/{id}:
+	 *   patch:
+	 *     summary: Edit own comment
+	 *     tags: [Comments]
+	 *     security: [{ bearerAuth: [] }]
+	 */
+	router.patch(
+		"/comments/:id",
+		requireAuth,
+		validate({
+			body: updateCommentBodySchema,
+		}),
+		async (req: AuthRequest, res: Response) => {
+			const { id } = req.params
+			const authorAddress = req.user?.address
+			const { content } = req.body as { content: string }
+			const safeContent = sanitizeHtml(content, {
+				allowedTags: [],
+				allowedAttributes: {},
+			})
+
+			if (content.length > maxCommentLength) {
+				return res.status(400).json({
+					error: "Comment must be 2,000 characters or fewer",
+				})
+			}
+
+			try {
+				const result = await pool.query(
+					`UPDATE comments SET content = $1 WHERE id = $2 AND author_address = $3 AND deleted_at IS NULL RETURNING *`,
+					[safeContent, id, authorAddress],
+				)
+				if (result.rows.length === 0) {
+					return res
+						.status(404)
+						.json({ error: "Comment not found or unauthorized" })
+				}
+				res.json(result.rows[0])
+			} catch (err) {
+				res.status(500).json({ error: "Failed to update comment" })
 			}
 		},
 	)
@@ -158,6 +228,20 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 	 *     summary: Delete own comment (soft delete)
 	 *     tags: [Comments]
 	 *     security: [{ bearerAuth: [] }]
+	 *     parameters:
+	 *       - in: path
+	 *         name: id
+	 *         required: true
+	 *         schema: { type: integer }
+	 *     responses:
+	 *       200:
+	 *         description: Comment deleted
+	 *       401:
+	 *         $ref: '#/components/responses/UnauthorizedError'
+	 *       404:
+	 *         $ref: '#/components/responses/NotFoundError'
+	 *       500:
+	 *         $ref: '#/components/responses/InternalServerError'
 	 */
 	router.delete(
 		"/comments/:id",
@@ -165,14 +249,12 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 		async (req: AuthRequest, res: Response) => {
 			const { id } = req.params
 			const authorAddress = req.user?.address
-
 			try {
 				// Check if comment exists and belongs to user (and not already deleted)
 				const checkResult = await pool.query(
 					`SELECT * FROM comments WHERE id = $1 AND author_address = $2 AND deleted_at IS NULL`,
 					[id, authorAddress],
 				)
-
 				if (checkResult.rows.length === 0) {
 					return res
 						.status(404)
@@ -184,7 +266,6 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 					`UPDATE comments SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1`,
 					[id],
 				)
-
 				res.json({ success: true })
 			} catch (err) {
 				res.status(500).json({ error: "Failed to delete comment" })
@@ -199,6 +280,33 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 	 *     summary: Upvote or downvote a comment
 	 *     tags: [Comments]
 	 *     security: [{ bearerAuth: [] }]
+	 *     parameters:
+	 *       - in: path
+	 *         name: id
+	 *         required: true
+	 *         schema: { type: integer }
+	 *     requestBody:
+	 *       required: true
+	 *       content:
+	 *         application/json:
+	 *           schema:
+	 *             type: object
+	 *             required: [type]
+	 *             properties:
+	 *               type:
+	 *                 type: string
+	 *                 enum: [upvote, downvote]
+	 *     responses:
+	 *       200:
+	 *         description: Vote recorded
+	 *       400:
+	 *         $ref: '#/components/responses/BadRequestError'
+	 *       401:
+	 *         $ref: '#/components/responses/UnauthorizedError'
+	 *       404:
+	 *         $ref: '#/components/responses/NotFoundError'
+	 *       500:
+	 *         $ref: '#/components/responses/InternalServerError'
 	 */
 	router.put(
 		"/comments/:id/vote",
@@ -208,10 +316,11 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 			const { type } = req.body // 'upvote' or 'downvote'
 			const voterAddress = req.user?.address
 
-			if (!["upvote", "downvote"].includes(type)) {
+			if (!VOTE_COLUMN[type]) {
 				return res.status(400).json({ error: "Invalid vote type" })
 			}
 
+			const col = VOTE_COLUMN[type]
 			const client = await pool.connect()
 			try {
 				await client.query("BEGIN")
@@ -230,18 +339,19 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 							[id, voterAddress],
 						)
 						await client.query(
-							`UPDATE comments SET ${type}s = ${type}s - 1 WHERE id = $1`,
+							`UPDATE comments SET ${col} = ${col} - 1 WHERE id = $1`,
 							[id],
 						)
 					} else {
 						// Change vote type
 						const oldType = existingVote.rows[0].vote_type
+						const oldCol = VOTE_COLUMN[oldType]
 						await client.query(
 							`UPDATE comment_votes SET vote_type = $1 WHERE comment_id = $2 AND voter_address = $3`,
 							[type, id, voterAddress],
 						)
 						await client.query(
-							`UPDATE comments SET ${type}s = ${type}s + 1, ${oldType}s = ${oldType}s - 1 WHERE id = $1`,
+							`UPDATE comments SET ${col} = ${col} + 1, ${oldCol} = ${oldCol} - 1 WHERE id = $1`,
 							[id],
 						)
 					}
@@ -252,7 +362,7 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 						[id, voterAddress, type],
 					)
 					await client.query(
-						`UPDATE comments SET ${type}s = ${type}s + 1 WHERE id = $1`,
+						`UPDATE comments SET ${col} = ${col} + 1 WHERE id = $1`,
 						[id],
 					)
 				}
@@ -279,6 +389,32 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 	 *     summary: Pin a comment (proposal author only)
 	 *     tags: [Comments]
 	 *     security: [{ bearerAuth: [] }]
+	 *     parameters:
+	 *       - in: path
+	 *         name: id
+	 *         required: true
+	 *         schema: { type: integer }
+	 *     requestBody:
+	 *       required: true
+	 *       content:
+	 *         application/json:
+	 *           schema:
+	 *             type: object
+	 *             required: [pinned]
+	 *             properties:
+	 *               pinned:
+	 *                 type: boolean
+	 *     responses:
+	 *       200:
+	 *         description: Pin updated
+	 *       400:
+	 *         $ref: '#/components/responses/BadRequestError'
+	 *       401:
+	 *         $ref: '#/components/responses/UnauthorizedError'
+	 *       404:
+	 *         $ref: '#/components/responses/NotFoundError'
+	 *       500:
+	 *         $ref: '#/components/responses/InternalServerError'
 	 */
 	router.put(
 		"/comments/:id/pin",
@@ -286,16 +422,13 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 		async (req: AuthRequest, res: Response) => {
 			const { id } = req.params
 			const authorAddress = req.user?.address
-
 			try {
 				// Check if the user is the author of the proposal associated with this comment
 				// For now, we'll assume a "proposal_authors" mapping or check a proposals table
 				// In a real app, you'd fetch the proposal by comment.proposal_id and check its author
-
 				// MOCK: Allow anyone to pin for now if they are the "author" of the proposal (which we'll just check against a param or something)
 				// Actually, the user says "Proposal author can pin one comment".
 				// I'll need a way to verify this.
-
 				const commentRes = await pool.query(
 					`SELECT proposal_id FROM comments WHERE id = $1 AND deleted_at IS NULL`,
 					[id],
@@ -327,7 +460,6 @@ export function createCommentsRouter(jwtService: JwtService): Router {
 				await pool.query(`UPDATE comments SET is_pinned = TRUE WHERE id = $1`, [
 					id,
 				])
-
 				res.json({ message: "Comment pinned" })
 			} catch (err) {
 				res.status(500).json({ error: "Failed to pin comment" })

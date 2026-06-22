@@ -1,12 +1,12 @@
 #![cfg(test)]
 
 use crate::{
-    AdminChangedEventData, DataKey, InitializedEventData, MintEventData, ScholarNFT, ScholarNFTClient,
-    ScholarNFTError,
+    AdminChangedEventData, DataKey, InitializedEventData, MintEventData, ScholarMetadata,
+    ScholarNFT, ScholarNFTClient, ScholarNFTError,
 };
 use soroban_sdk::{
-    testutils::{storage::Persistent, Address as _, Events as _, MockAuth, MockAuthInvoke},
-    Address, Env, IntoVal, String, symbol_short,
+    Address, BytesN, Env, IntoVal, String, symbol_short,
+    testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke, storage::Persistent},
 };
 
 fn setup(env: &Env) -> (Address, Address, ScholarNFTClient) {
@@ -20,6 +20,18 @@ fn setup(env: &Env) -> (Address, Address, ScholarNFTClient) {
 
 fn cid(env: &Env, value: &str) -> String {
     String::from_str(env, value)
+}
+
+fn authorize_upgrade(env: &Env, contract_id: &Address, signer: &Address, wasm_hash: &BytesN<32>) {
+    env.mock_auths(&[MockAuth {
+        address: signer,
+        invoke: &MockAuthInvoke {
+            contract: contract_id,
+            fn_name: "upgrade",
+            args: (wasm_hash.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
 }
 
 #[test]
@@ -44,6 +56,34 @@ fn owner_of_returns_minted_owner() {
     let token_id = client.mint(&scholar, &cid(&env, "ipfs://owner-check"));
 
     assert_eq!(client.owner_of(&token_id), scholar);
+}
+
+#[test]
+fn get_all_scholars_is_empty_before_mint() {
+    let env = Env::default();
+    let (_, _admin, client) = setup(&env);
+
+    assert_eq!(client.get_all_scholars().len(), 0);
+}
+
+#[test]
+fn get_all_scholars_returns_all_minted_scholars_in_order() {
+    let env = Env::default();
+    let (_, _admin, client) = setup(&env);
+    let scholar_a = Address::generate(&env);
+    let scholar_b = Address::generate(&env);
+    let scholar_c = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.mint(&scholar_a, &cid(&env, "ipfs://scholar-a"));
+    client.mint(&scholar_b, &cid(&env, "ipfs://scholar-b"));
+    client.mint(&scholar_c, &cid(&env, "ipfs://scholar-c"));
+
+    let scholars = client.get_all_scholars();
+    assert_eq!(scholars.len(), 3);
+    assert_eq!(scholars.get(0).unwrap(), scholar_a);
+    assert_eq!(scholars.get(1).unwrap(), scholar_b);
+    assert_eq!(scholars.get(2).unwrap(), scholar_c);
 }
 
 #[test]
@@ -161,6 +201,22 @@ fn token_uri_returns_metadata_uri() {
     let token_id = client.mint(&scholar, &metadata_uri);
 
     assert_eq!(client.token_uri(&token_id), metadata_uri);
+}
+
+#[test]
+fn get_metadata_uri_round_trip() {
+    let env = Env::default();
+    let (_, _admin, client) = setup(&env);
+    let scholar = Address::generate(&env);
+    let uri = cid(
+        &env,
+        "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    );
+
+    env.mock_all_auths();
+    let token_id = client.mint(&scholar, &uri);
+
+    assert_eq!(client.get_metadata_uri(&token_id), uri);
 }
 
 #[test]
@@ -288,11 +344,12 @@ fn initialize_emits_event() {
 
     let events = env.events().all();
     let found = events.iter().any(|(_, topics, data)| {
-        topics.contains(&symbol_short!("init").into_val(&env))
-            && {
-                let d: InitializedEventData = data.clone().into_val(&env);
-                d == InitializedEventData { admin: admin.clone() }
+        topics.contains(&symbol_short!("init").into_val(&env)) && {
+            let d: InitializedEventData = data.clone().into_val(&env);
+            d == InitializedEventData {
+                admin: admin.clone(),
             }
+        }
     });
     assert!(found, "initialized event not found");
 }
@@ -302,7 +359,7 @@ fn mint_emits_event() {
     let env = Env::default();
     let (_, _admin, client) = setup(&env);
     let scholar = Address::generate(&env);
-    let uri = cid(&env, "ipfs://mint-event-test");
+    let uri = cid(&env, "ipfs://mint-event");
 
     env.mock_all_auths();
     let token_id = client.mint(&scholar, &uri);
@@ -313,7 +370,10 @@ fn mint_emits_event() {
             && topics.contains(&token_id.into_val(&env))
             && {
                 let d: MintEventData = data.clone().into_val(&env);
-                d == MintEventData { token_id, owner: scholar.clone() }
+                d == MintEventData {
+                    token_id,
+                    owner: scholar.clone(),
+                }
             }
     });
     assert!(found, "mint event not found");
@@ -330,14 +390,13 @@ fn transfer_admin_emits_event() {
 
     let events = env.events().all();
     let found = events.iter().any(|(_, topics, data)| {
-        topics.contains(&symbol_short!("adm_chng").into_val(&env))
-            && {
-                let d: AdminChangedEventData = data.clone().into_val(&env);
-                d == AdminChangedEventData {
-                    old_admin: old_admin.clone(),
-                    new_admin: new_admin.clone(),
-                }
+        topics.contains(&symbol_short!("adm_chng").into_val(&env)) && {
+            let d: AdminChangedEventData = data.clone().into_val(&env);
+            d == AdminChangedEventData {
+                old_admin: old_admin.clone(),
+                new_admin: new_admin.clone(),
             }
+        }
     });
     assert!(found, "admin_changed event not found");
 }
@@ -384,8 +443,111 @@ fn test_mint_extends_ttl() {
     let token_id = client.mint(&scholar, &cid(&env, "ipfs://ttl-test"));
 
     env.as_contract(&contract_id, || {
-        assert!(env.storage().persistent().get_ttl(&DataKey::Owner(token_id)) >= 6_307_200);
-        assert!(env.storage().persistent().get_ttl(&DataKey::TokenUri(token_id)) >= 6_307_200);
-        assert!(env.storage().persistent().get_ttl(&DataKey::Metadata(token_id)) >= 6_307_200);
+        assert!(
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Owner(token_id))
+                >= 6_307_200
+        );
+        assert!(
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::TokenUri(token_id))
+                >= 6_307_200
+        );
+        assert!(
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Metadata(token_id))
+                >= 6_307_200
+        );
     });
+}
+
+#[test]
+fn upgrade_requires_admin_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let contract_id = env.register(ScholarNFT, ());
+    let client = ScholarNFTClient::new(&env, &contract_id);
+
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&admin,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&admin);
+
+    let wasm_hash = crate::upgrade::testutils::upload_upgrade_target(&env);
+    authorize_upgrade(&env, &contract_id, &attacker, &wasm_hash);
+    assert!(client.try_upgrade(&wasm_hash).is_err());
+}
+
+#[test]
+fn state_persists_after_upgrade() {
+    let env = Env::default();
+    let (contract_id, admin, client) = setup(&env);
+    let scholar = Address::generate(&env);
+    let metadata_uri = cid(&env, "ipfs://upgrade-check");
+
+    env.mock_all_auths();
+    let token_id = client.mint(&scholar, &metadata_uri);
+
+    env.set_auths(&[]);
+    let wasm_hash = crate::upgrade::testutils::upload_upgrade_target(&env);
+    authorize_upgrade(&env, &contract_id, &admin, &wasm_hash);
+    client.upgrade(&wasm_hash);
+
+    let metadata = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<_, ScholarMetadata>(&DataKey::Metadata(token_id))
+    });
+    let stored_hash = env.as_contract(&contract_id, || crate::upgrade::current_hash(&env));
+
+    let metadata = metadata.expect("metadata should persist across upgrades");
+    assert_eq!(metadata.owner, scholar);
+    assert_eq!(metadata.metadata_uri, metadata_uri);
+    assert_eq!(stored_hash, wasm_hash);
+}
+
+#[test]
+fn benchmark_costs() {
+    let e = Env::default();
+
+    // 1. Benchmark initialize
+    let fresh_admin = Address::generate(&e);
+    let id = e.register(ScholarNFT, ());
+    let fresh_client = ScholarNFTClient::new(&e, &id);
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+    fresh_client.initialize(&fresh_admin);
+    let init_instr = e.cost_estimate().budget().cpu_instruction_cost();
+    let init_mem = e.cost_estimate().budget().memory_bytes_cost();
+
+    // 2. Benchmark mint
+    let user = Address::generate(&e);
+    let (_, _, client) = setup(&e);
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+    client.mint(&user, &String::from_str(&e, "ipfs://test"));
+    let mint_instr = e.cost_estimate().budget().cpu_instruction_cost();
+    let mint_mem = e.cost_estimate().budget().memory_bytes_cost();
+
+    // 3. Benchmark get_all_scholars
+    e.cost_estimate().budget().reset_unlimited();
+    client.get_all_scholars();
+    let get_instr = e.cost_estimate().budget().cpu_instruction_cost();
+    let get_mem = e.cost_estimate().budget().memory_bytes_cost();
+
+    extern crate std;
+    std::println!("BENCHMARK_RESULTS: scholar_nft");
+    std::println!("initialize: instr={}, mem={}", init_instr, init_mem);
+    std::println!("mint: instr={}, mem={}", mint_instr, mint_mem);
+    std::println!("get_all_scholars: instr={}, mem={}", get_instr, get_mem);
 }
